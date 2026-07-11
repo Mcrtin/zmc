@@ -1,0 +1,23 @@
+.{
+    .name = .zmc,
+    .version = "0.1.0",
+    .fingerprint = 0xa2cf119c920ec8fc,
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders#207c34a16e4365edc20d92c7892f962b3bed46e8",
+            .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
+        },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#48fa4043c3cbdc84330642809fb6a520db79afbe",
+            .hash = "vaxis-0.6.0-BWNV_A36CQDTEaoBG8MPZLnWhb9nUVbcj33i0oC_ImlW",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
