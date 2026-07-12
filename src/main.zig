@@ -3,33 +3,42 @@ const Io = std.Io;
 const paths_mod = @import("paths.zig");
 const mojang = @import("mojang.zig");
 const msa = @import("msa.zig");
+const select = @import("select.zig");
+const known_folders = @import("known-folders");
+const SessionStore = @import("SessionStore.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    // const option = try select.select(io, gpa, init.environ_map, "test", &.{ .{ .label = "opt1" }, .{ .label = "opt 2" } });
+    // std.debug.print("option select: {?d}\n", .{option});
 
     var args_it = try init.minimal.args.iterateAllocator(gpa);
     defer args_it.deinit();
     _ = args_it.next(); // skip argv[0]
 
     var requested_version: ?[]const u8 = null;
-    var offline_name: ?[]const u8 = null;
-    var use_auth = false;
+    var offline = false;
+    var name: ?[]const u8 = null;
 
     while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--version")) {
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             requested_version = args_it.next() orelse return error.MissingVersionArg;
-        } else if (std.mem.eql(u8, arg, "--offline")) {
-            offline_name = args_it.next() orelse "Player";
-        } else if (std.mem.eql(u8, arg, "--auth")) {
-            use_auth = true;
+        } else if (std.mem.eql(u8, arg, "--offline") or std.mem.eql(u8, arg, "-o")) {
+            offline = true;
+            name = args_it.next() orelse "Player";
+        } else if (std.mem.eql(u8, arg, "--login") or std.mem.eql(u8, arg, "-l")) {
+            name = args_it.next();
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
         }
     }
 
-    if (offline_name == null and !use_auth) offline_name = "Player";
+    const cache_path = try known_folders.getPath(io, gpa, init.environ_map, .cache);
+
+    const store = if (cache_path) |c| try SessionStore.init(io, c) else null;
+    defer if (store) |s| s.deinit(io);
 
     var mc_paths = try paths_mod.resolve(io, gpa, init.environ_map);
     defer mc_paths.deinit();
@@ -52,10 +61,22 @@ pub fn main(init: std.process.Init) !void {
 
     try mojang.ensureAssets(io, gpa, &client, &mc_paths, version);
 
-    var session: mojang.Session = if (use_auth)
-        try msa.authenticate(io, gpa, &client)
+    var refresh_token_buf: [1024]u8 = undefined;
+    var last_name_buf: [1024]u8 = undefined;
+
+    const selected_name = name orelse if (store) |s| try s.last(io, &last_name_buf) else null;
+    const refresh_token = if (selected_name) |n|
+        (if (store) |s| try s.read(io, n, &refresh_token_buf) else null)
     else
-        try mojang.offlineSession(gpa, offline_name.?);
+        null;
+
+    var session: mojang.Session = if (!offline)
+        try msa.authenticate(io, gpa, &client, refresh_token)
+    else
+        try mojang.offlineSession(gpa, name.?);
+    if (session.refresh_token) |r| {
+        if (store) |s| try s.write(io, session.username, r);
+    }
     defer session.deinit(gpa);
     const features: mojang.Features = .{};
 
@@ -78,16 +99,14 @@ fn printHelp() void {
         \\
         \\Fetches the version manifest, client jar, libraries/natives, and
         \\assets from Mojang's public endpoints into the standard .minecraft
-        \\directory (auto-detected per OS), then launches the game with java.
+        \\directory, then launches the game with java.
         \\
         \\Usage:
         \\  zmc [--version <id>] [--offline [name] | --auth]
         \\
-        \\  --version <id>    Specific version id (default: latest release)
-        \\  --offline [name]  Launch offline/singleplayer as <name> (default: "Player")
-        \\  --auth            Sign in with a Microsoft account for online play
-        \\
-        \\If neither --offline nor --auth is given, --offline "Player" is used.
+        \\  -v --version <id>    Specific version id (default: latest release)
+        \\  -o --offline [name]  Launch offline/singleplayer as <name> (default: "Player")
+        \\  -l --login   [name]  Sign in with a Microsoft account for online play (default: last selected)
         \\
     , .{});
 }

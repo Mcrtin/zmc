@@ -3,36 +3,51 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const http = @import("http.zig");
 const iofs = @import("iofs.zig");
+const JavaVersion = struct {
+    availability: struct {
+        group: u32,
+        progress: u32,
+    },
+    manifest: struct {
+        sha1: []const u8,
+        size: u32,
+        url: []const u8,
+    },
+    version: struct {
+        name: []const u8,
+        released: []const u8,
+    },
+};
+const JavaVersions = std.json.ArrayHashMap([]const JavaVersion);
 
-// The official launcher doesn't rely on a system-installed JDK at all --
-// it downloads its own, per Minecraft-version-appropriate JRE from a
-// separate Mojang manifest, because the required Java version varies by
-// Minecraft version and most users don't have a matching JDK installed.
-// We do the same here, so `zmc` works out of the box without the user
-// needing to have Java set up correctly (or at all).
-//
-// The index below is a fixed, well-known URL (documented by the
-// unofficial wiki.vg protocol docs) that Mojang's own launcher reads from;
-// it's not something that rotates per-request.
+const RuntimeIndex = struct {
+    gamecore: JavaVersions,
+    linux: JavaVersions,
+    @"linux-i386": JavaVersions,
+    @"mac-os": JavaVersions,
+    @"mac-os-arm64": JavaVersions,
+    @"windows-arm64": JavaVersions,
+    @"windows-x64": JavaVersions,
+    @"windows-x86": JavaVersions,
+};
+
 const RUNTIME_INDEX_URL = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
-fn platformKey() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => switch (builtin.cpu.arch) {
-            .aarch64 => "windows-arm64",
-            .x86 => "windows-x86",
-            else => "windows-x64",
-        },
-        .macos => switch (builtin.cpu.arch) {
-            .aarch64 => "mac-os-arm64",
-            else => "mac-os",
-        },
-        else => switch (builtin.cpu.arch) {
-            .x86 => "linux-i386",
-            else => "linux",
-        },
-    };
-}
+const platformKey = switch (builtin.os.tag) {
+    .windows => switch (builtin.cpu.arch) {
+        .aarch64 => "windows-arm64",
+        .x86 => "windows-x86",
+        else => "windows-x64",
+    },
+    .macos => switch (builtin.cpu.arch) {
+        .aarch64 => "mac-os-arm64",
+        else => "mac-os",
+    },
+    else => switch (builtin.cpu.arch) {
+        .x86 => "linux-i386",
+        else => "linux",
+    },
+};
 
 /// Ensures Mojang's bundled JRE for this version is present under
 /// <mc_root>/runtime/<component>/<platform>/, downloading it on first use,

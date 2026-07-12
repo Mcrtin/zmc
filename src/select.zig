@@ -36,22 +36,23 @@ const Event = union(enum) {
 /// Type to filter, Up/Down (or Ctrl-P/Ctrl-N) to move, Enter to confirm,
 /// Esc/Ctrl-C to cancel. Returns the index into `options`, or null if
 /// cancelled.
-pub fn select(io: Io, allocator: std.mem.Allocator, prompt: []const u8, options: []const Option) !?usize {
-    var tty = try vaxis.Tty.init();
+pub fn select(io: Io, allocator: std.mem.Allocator, env_map: *std.process.Environ.Map, prompt: []const u8, options: []const Option) !?usize {
+    var buf: [1024]u8 = undefined;
+    var tty = try vaxis.Tty.init(io, &buf);
     defer tty.deinit();
 
-    var vx = try vaxis.init(allocator, .{});
-    defer vx.deinit(allocator, tty.anyWriter());
+    var vx = try vaxis.init(io, allocator, env_map, .{});
+    defer vx.deinit(allocator, tty.writer());
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
     try loop.start();
     defer loop.stop();
 
-    try vx.enterAltScreen(tty.anyWriter());
-    defer vx.exitAltScreen(tty.anyWriter()) catch {};
-    try vx.queryTerminal(tty.anyWriter(), .fromSeconds(1));
+    // try vx.enterAltScreen(tty.writer());
+    // defer vx.exitAltScreen(tty.writer()) catch {};
+    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
-    var query = std.ArrayListUnmanaged(u8){};
+    var query: std.ArrayList(u8) = .empty;
     defer query.deinit(allocator);
 
     const filtered = try allocator.alloc(usize, options.len);
@@ -65,7 +66,7 @@ pub fn select(io: Io, allocator: std.mem.Allocator, prompt: []const u8, options:
     while (true) {
         const event = try loop.nextEvent();
         switch (event) {
-            .winsize => |ws| try vx.resize(allocator, tty.anyWriter(), ws),
+            .winsize => |ws| try vx.resize(allocator, tty.writer(), ws),
             .key_press => |key| {
                 if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
                     return null;
@@ -88,8 +89,8 @@ pub fn select(io: Io, allocator: std.mem.Allocator, prompt: []const u8, options:
             },
         }
 
-        draw(vx, prompt, query.items, options, filtered[0..filtered_len], cursor);
-        try vx.render(tty.anyWriter());
+        draw(&vx, prompt, query.items, options, filtered[0..filtered_len], cursor);
+        try vx.render(tty.writer());
     }
 }
 
@@ -113,9 +114,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn draw(vx: vaxis.Vaxis, prompt: []const u8, query: []const u8, options: []const Option, filtered: []const usize, cursor: usize) void {
+fn draw(vx: *vaxis.Vaxis, prompt: []const u8, query: []const u8, options: []const Option, filtered: []const usize, cursor: usize) void {
     const win = vx.window();
-    win.clear();
 
     writeText(win, 0, 0, prompt, .{ .bold = true });
     writeText(win, @intCast(prompt.len + 1), 0, query, .{});

@@ -6,9 +6,8 @@ pkgs.mkShell {
   name = "minecraft-dev-env";
 
   nativeBuildInputs = [
-    pkgs.gradle
     pkgs.openjdk25
-  ]; # or openjdk17, depending on MC version
+  ];
 
   buildInputs = with pkgs; [
     vulkan-loader

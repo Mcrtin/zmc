@@ -9,13 +9,17 @@ const MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2
 pub const Session = struct {
     username: []const u8,
     uuid: []const u8,
+    xuid: []const u8,
     access_token: []const u8,
+    refresh_token: ?[]const u8,
     user_type: enum { legacy, msa },
 
     pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         allocator.free(self.username);
         allocator.free(self.uuid);
+        allocator.free(self.xuid);
         allocator.free(self.access_token);
+        if (self.refresh_token) |t| allocator.free(t);
     }
 };
 
@@ -43,7 +47,9 @@ pub fn offlineSession(allocator: std.mem.Allocator, name: []const u8) !Session {
         .username = try allocator.dupe(u8, name),
         .uuid = uuid_str,
         .access_token = try allocator.dupe(u8, "0"),
+        .xuid = try allocator.dupe(u8, "0"),
         .user_type = .legacy,
+        .refresh_token = null,
     };
 }
 
@@ -158,11 +164,11 @@ pub fn ensureLibraries(
         if (!libraryAllowed(lib)) continue;
 
         const artifact = if (lib.downloads.classifiers) |classifiers|
-            switch (currentOsName) {
-                .linux => classifiers.@"native-linux",
-                .osx => classifiers.@"native-macos",
-                .windows => classifiers.@"native-windows",
-            }
+            if (switch (currentOsName) {
+                .linux => lib.natives.linux,
+                .osx => lib.natives.osx,
+                .windows => lib.natives.windows,
+            }) |name| classifiers.map.get(name) else null
         else
             lib.downloads.artifact;
         const libs_dir = try Io.Dir.cwd().createDirPathOpen(io, paths.libraries, .{});
@@ -315,6 +321,7 @@ pub fn launch(
     const ctx = SubstCtx{
         .paths = paths,
         .version_id = version_id,
+        .version_type = version.type,
         .asset_index_id = asset_index_id,
         .session = session,
         .classpath = cp.items,
@@ -340,6 +347,7 @@ pub fn launch(
     try argv.appendSlice(gpa, game_args);
 
     std.log.info("Launching Minecraft {s} as {s} with command (accessToken has been redacted):\n{f}", .{ version_id, session.username, std.fmt.Alt([]const []const u8, formatJoin){ .data = argv.items } });
+    try std.process.setCurrentPath(io, paths.root);
     return std.process.replace(io, .{ .argv = argv.items, .expand_arg0 = .expand });
 }
 
@@ -380,22 +388,30 @@ const Artifact = struct {
     size: usize,
     url: []const u8,
 };
+const Download = struct {
+    sha1: []const u8,
+    size: usize,
+    url: []const u8,
+};
+const LibDownloads = struct {
+    artifact: ?Artifact = null,
+    classifiers: ?std.json.ArrayHashMap(Artifact) = null,
+};
 const Library = struct {
-    downloads: struct {
-        artifact: Artifact,
-        classifiers: ?struct {
-            @"native-linux": ?Artifact = null,
-            @"native-macos": ?Artifact = null,
-            @"native-windows": ?Artifact = null,
-        } = null,
-    },
+    downloads: LibDownloads,
     name: []const u8,
-    natives: ?struct { linux: enum { @"native-linux" } = .@"native-linux", osx: enum { @"native-macos" } = .@"native-macos", windows: enum { @"native-windows" } = .@"native-windows" } = null,
+    natives: struct { linux: ?[]const u8 = null, osx: ?[]const u8 = null, windows: ?[]const u8 = null } = .{},
     extract: ?struct {
         exclude: []const []const u8,
-        name: []const u8,
     } = null,
     rules: []const Rule = &.{},
+};
+const Downloads = struct {
+    client: Download,
+    client_mappings: ?Download = null,
+    server: ?Download = null,
+    server_mappings: ?Download = null,
+    windows_server: ?Download = null,
 };
 const Package = struct {
     arguments: ?struct {
@@ -404,16 +420,13 @@ const Package = struct {
         jvm: []const std.json.Value,
     } = null,
     minecraftArguments: ?[]const u8 = null,
-    assetIndex: struct { id: []const u8, sha1: []const u8, size: usize, totalSize: usize, url: []const u8 },
-    assets: usize,
-    complianceLevel: u8,
-    downloads: struct {
-        client: struct { sha1: []const u8, size: usize, url: []const u8 },
-        server: struct { sha1: []const u8, size: usize, url: []const u8 },
-    },
-    javaVersion: struct { component: []const u8, majorVersion: u8 },
+    assetIndex: struct { id: []const u8, sha1: []const u8, size: u32, totalSize: u32, url: []const u8 },
+    assets: []const u8,
+    complianceLevel: ?u8 = null,
+    downloads: Downloads,
+    javaVersion: ?struct { component: []const u8, majorVersion: u8 } = null,
     libraries: []Library,
-    logging: struct {
+    logging: ?struct {
         client: struct {
             argument: []const u8,
             file: struct {
@@ -424,7 +437,7 @@ const Package = struct {
             },
             type: []const u8,
         },
-    },
+    } = null,
     mainClass: []const u8,
     minimumLauncherVersion: u32,
 
@@ -541,6 +554,7 @@ fn buildJvmArgs(allocator: std.mem.Allocator, version: Package, features: Featur
 const SubstCtx = struct {
     paths: *Paths,
     version_id: []const u8,
+    version_type: VersionType,
     asset_index_id: []const u8,
     session: Session,
     classpath: []const u8,
@@ -553,18 +567,25 @@ fn substituteAll(allocator: std.mem.Allocator, raw: [][]const u8, ctx: SubstCtx)
 
 fn substitutePlaceholder(allocator: std.mem.Allocator, tok: []const u8, ctx: SubstCtx) ![]u8 {
     const Pair = struct { key: []const u8, val: []const u8 };
+    var buf: [4096]u8 = undefined;
+    const auth_session = if (ctx.session.access_token.len == 0) "" else try std.fmt.bufPrint(&buf, "token:{s}:{s}", .{ ctx.session.access_token, ctx.session.uuid }); //TODO: uuid simple??
     const pairs = [_]Pair{
         .{ .key = "${auth_player_name}", .val = ctx.session.username },
+        .{ .key = "${auth_uuid}", .val = ctx.session.uuid },
+        .{ .key = "${auth_access_token}", .val = ctx.session.access_token },
+        .{ .key = "${user_type}", .val = @tagName(ctx.session.user_type) },
+
+        // legacy
+        .{ .key = "${clientid}", .val = "0" },
+        .{ .key = "${auth_xuid}", .val = ctx.session.xuid },
+        .{ .key = "${auth_session}", .val = auth_session },
+        .{ .key = "${user_properties}", .val = "{}" },
+
+        .{ .key = "${version_type}", .val = @tagName(ctx.version_type) },
         .{ .key = "${version_name}", .val = ctx.version_id },
         .{ .key = "${game_directory}", .val = ctx.paths.root },
         .{ .key = "${assets_root}", .val = ctx.paths.assets },
         .{ .key = "${assets_index_name}", .val = ctx.asset_index_id },
-        .{ .key = "${auth_uuid}", .val = ctx.session.uuid },
-        .{ .key = "${auth_access_token}", .val = ctx.session.access_token },
-        .{ .key = "${user_type}", .val = @tagName(ctx.session.user_type) },
-        .{ .key = "${version_type}", .val = "release" },
-        .{ .key = "${clientid}", .val = "0" },
-        .{ .key = "${auth_xuid}", .val = "0" },
         // jvm-args-only placeholders:
         .{ .key = "${natives_directory}", .val = ctx.paths.natives_root },
         .{ .key = "${library_directory}", .val = ctx.paths.libraries },
@@ -583,4 +604,18 @@ fn substitutePlaceholder(allocator: std.mem.Allocator, tok: []const u8, ctx: Sub
         }
     }
     return result;
+}
+
+test "json parsing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var client = std.http.Client{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    const manifest = try http.requestJson(Manifest, arena.allocator(), &client, manifest_url, &.{}, null);
+    for (manifest.versions) |v| {
+        const value = try http.requestJson(Package, arena.allocator(), &client, try std.Uri.parse(v.url), &.{}, null);
+        _ = value;
+    }
 }

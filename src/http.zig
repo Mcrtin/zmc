@@ -1,5 +1,6 @@
 const Io = std.Io;
 const std = @import("std");
+const msa = @import("msa.zig");
 
 pub fn requestJson(T: type, arena: std.mem.Allocator, client: *std.http.Client, url: std.Uri, headers: []const std.http.Header, payload: ?[]const u8) !T {
     var req = try client.request(if (payload == null) .GET else .POST, url, .{ .extra_headers = headers });
@@ -24,44 +25,7 @@ pub fn requestJson(T: type, arena: std.mem.Allocator, client: *std.http.Client, 
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buf, &decompress, &compress_buf);
     var r = std.json.Reader.init(arena, reader);
-    return std.json.parseFromTokenSourceLeaky(T, arena, &r, .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| switch (err) {
-        error.UnknownField => {
-            const next = try std.json.innerParse(std.json.Value, arena, &r, .{ .max_value_len = 100 });
-            std.debug.print("next token: \n", .{});
-            printVal(next);
-
-            return err;
-        },
-        else => |e| return e,
-    };
-}
-fn printVal(val: std.json.Value) void {
-    switch (val) {
-        .string => |s| std.debug.print("{s}", .{s}),
-        .bool => |b| std.debug.print("{s}", .{if (b) "true" else "false"}),
-        .float => |f| std.debug.print("{d}", .{f}),
-        .integer => |i| std.debug.print("{d}", .{i}),
-        .null => std.debug.print("null", .{}),
-        .number_string => |s| std.debug.print("{s}", .{s}),
-        .array => |a| {
-            std.debug.print("[", .{});
-            for (a.items) |item| {
-                printVal(item);
-                std.debug.print(",\n", .{});
-            }
-            std.debug.print("]", .{});
-        },
-        .object => |s| {
-            std.debug.print("{{", .{});
-            var it = s.iterator();
-            while (it.next()) |entry| {
-                std.debug.print("{s} = ", .{entry.key_ptr.*});
-                printVal(entry.value_ptr.*);
-                std.debug.print(",\n", .{});
-            }
-            std.debug.print("}}", .{});
-        },
-    }
+    return std.json.parseFromTokenSourceLeaky(T, arena, &r, .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
 }
 
 // TODO: make it able to detect unfinished downloads
