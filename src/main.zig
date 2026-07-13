@@ -10,8 +10,6 @@ const SessionStore = @import("SessionStore.zig");
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
-    // const option = try select.select(io, gpa, init.environ_map, "test", &.{ .{ .label = "opt1" }, .{ .label = "opt 2" } });
-    // std.debug.print("option select: {?d}\n", .{option});
 
     var args_it = try init.minimal.args.iterateAllocator(gpa);
     defer args_it.deinit();

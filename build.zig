@@ -5,7 +5,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const known_folders = b.dependency("known_folders", .{});
-    const vaxis = b.dependency("vaxis", .{});
 
     const mod = b.addModule("zmc", .{
         .root_source_file = b.path("src/root.zig"),
@@ -21,7 +20,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zmc", .module = mod },
                 .{ .name = "known-folders", .module = known_folders.module("known-folders") },
-                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             },
         }),
     });
