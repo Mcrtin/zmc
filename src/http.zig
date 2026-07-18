@@ -28,17 +28,33 @@ pub fn requestJson(T: type, arena: std.mem.Allocator, client: *std.http.Client, 
     return std.json.parseFromTokenSourceLeaky(T, arena, &r, .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
 }
 
-// TODO: make it able to detect unfinished downloads
-pub fn downloadToFile(
-    client: *std.http.Client,
-    url: []const u8,
-    sha1: []const u8,
-    writer: *Io.Writer,
-) !void {
-    defer writer.flush() catch {};
+pub fn pathsToFile(io: Io, size: usize, paths: []const []const u8, suffix: []const u8) !struct { file: Io.File, download: bool } {
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{f}{s}", .{ std.fs.path.fmtJoin(paths), suffix });
+    const dir_path = Io.Dir.path.dirname(path).?;
+    const file_name = Io.Dir.path.basename(path);
+
+    const dir = try Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+    defer dir.close(io);
+
+    const final: ?Io.File = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => |e| return e,
+    };
+    errdefer if (final) |f| f.close(io);
+
+    return if (final == null or try final.?.length(io) != size)
+        .{ .file = try dir.createFile(io, file_name, .{ .read = true }), .download = true }
+    else
+        .{ .file = final.?, .download = false };
+}
+
+pub fn download(io: Io, client: *std.http.Client, url: []const u8, sha1: []const u8, file: Io.File) !void {
+    var buf: [1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
     var hash_buf: [1024]u8 = undefined;
     var hasher: std.crypto.hash.Sha1 = .init(.{});
-    var hashing_writer = writer.hashed(&hasher, &hash_buf);
+    var hashing_writer = writer.interface.hashed(&hasher, &hash_buf);
     const res = try client.fetch(.{ .response_writer = &hashing_writer.writer, .location = .{ .url = url } });
     try hashing_writer.writer.flush();
     try writer.flush();

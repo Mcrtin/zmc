@@ -3,7 +3,6 @@ const Io = std.Io;
 const paths_mod = @import("paths.zig");
 const mojang = @import("mojang.zig");
 const msa = @import("msa.zig");
-const select = @import("select.zig");
 const known_folders = @import("known-folders");
 const SessionStore = @import("SessionStore.zig");
 
@@ -34,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cache_path = try known_folders.getPath(io, gpa, init.environ_map, .cache);
+    defer if (cache_path) |c| gpa.free(c);
 
     const store = if (cache_path) |c| try SessionStore.init(io, c) else null;
     defer if (store) |s| s.deinit(io);
@@ -45,19 +45,28 @@ pub fn main(init: std.process.Init) !void {
     var client = std.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
+    std.log.info("Fetching version manifest", .{});
     const manifest = try mojang.fetchVersionManifest(init.arena.allocator(), &client);
 
-    const chosen = try mojang.pickVersion(manifest, requested_version);
+    const target_id = requested_version orelse manifest.latest.release;
+    const chosen = blk: {
+        for (manifest.versions) |v| {
+            if (std.mem.eql(u8, v.id, target_id)) break :blk v;
+        } else return error.VersionNotFound;
+    };
     std.log.info("Selected version: {s}", .{chosen.id});
 
     const version = try mojang.fetchVersion(init.arena.allocator(), &client, chosen.url);
 
-    try mojang.ensureClient(io, &client, &mc_paths, chosen.id, version);
+    var group: Io.Group = .init;
+    const node = std.Progress.start(io, .{ .root_name = "downloading minecraft" });
 
-    var classpath_list = try mojang.ensureLibraries(io, gpa, &client, &mc_paths, version);
-    defer classpath_list.deinit(gpa);
+    group.async(io, ensureClient, .{ io, node, &client, &mc_paths, chosen.id, version });
 
-    try mojang.ensureAssets(io, gpa, &client, &mc_paths, version);
+    const classpath_list = try mojang.ensureLibraries(io, gpa, node, &client, &mc_paths, version);
+    defer gpa.free(classpath_list);
+
+    try mojang.ensureAssets(io, gpa, node, &client, &mc_paths, version);
 
     var refresh_token_buf: [1024]u8 = undefined;
     var last_name_buf: [1024]u8 = undefined;
@@ -78,17 +87,34 @@ pub fn main(init: std.process.Init) !void {
     defer session.deinit(gpa);
     const features: mojang.Features = .{};
 
+    try group.await(io);
+    node.end();
+
     try mojang.launch(
         io,
         gpa,
         &mc_paths,
         chosen.id,
-        classpath_list.items,
+        classpath_list,
         version.assetIndex.id,
         version,
         session,
         features,
     );
+}
+pub fn ensureClient(
+    io: Io,
+    node: std.Progress.Node,
+    client: *std.http.Client,
+    paths: *paths_mod.Paths,
+    version_id: []const u8,
+    version: mojang.Package,
+) void {
+    const client_node = node.start("downloading client", 0);
+    mojang.ensureClient(io, node, client, paths, version_id, version) catch |err| {
+        std.log.err("error while downloading client: {t}", .{err});
+    };
+    client_node.end();
 }
 
 fn printHelp() void {

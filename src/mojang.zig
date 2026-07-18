@@ -53,68 +53,33 @@ pub fn offlineSession(allocator: std.mem.Allocator, name: []const u8) !Session {
     };
 }
 
-// ---------------------------------------------------------------------
-// Version manifest / version json
-// ---------------------------------------------------------------------
-
 pub fn fetchVersionManifest(arena: std.mem.Allocator, client: *std.http.Client) !Manifest {
     return http.requestJson(Manifest, arena, client, manifest_url, &.{}, null);
-}
-
-pub const ChosenVersion = struct { id: []const u8, url: []const u8 };
-
-pub fn pickVersion(manifest: Manifest, requested: ?[]const u8) !ChosenVersion {
-    const target_id: []const u8 = requested orelse manifest.latest.release;
-    for (manifest.versions) |v| {
-        if (std.mem.eql(u8, v.id, target_id)) {
-            return .{ .id = v.id, .url = v.url };
-        }
-    }
-    return error.VersionNotFound;
 }
 
 pub fn fetchVersion(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) !Package {
     return http.requestJson(Package, arena, client, try std.Uri.parse(url), &.{}, null);
 }
-
-// ---------------------------------------------------------------------
-// Client jar
-// ---------------------------------------------------------------------
-
-fn fileExists(io: Io, path: []const u8) bool {
-    Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
 pub fn ensureClient(
     io: Io,
+    node: std.Progress.Node,
     client: *std.http.Client,
     paths: *Paths,
     version_id: []const u8,
     version: Package,
 ) !void {
-    // TODO: wrong path?!
-    const versions_dir = try Io.Dir.cwd().createDirPathOpen(io, paths.versions, .{});
-    defer versions_dir.close(io);
-    const jar_dir = try versions_dir.createDirPathOpen(io, version_id, .{});
-    defer jar_dir.close(io);
-    var fmt_buf: [Io.Dir.max_name_bytes]u8 = undefined;
-    const jar_path = try std.fmt.bufPrint(&fmt_buf, "{s}.jar", .{version_id});
-    const file = jar_dir.createFile(io, jar_path, .{ .read = true, .exclusive = true }) catch |err| switch (err) {
-        error.PathAlreadyExists => return,
-        else => |e| return e,
-    };
-    defer file.close(io);
-    var buf: [1024]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    std.log.info("Downloading client jar for {s}...", .{version_id});
-    try http.downloadToFile(client, version.downloads.client.url, version.downloads.client.sha1, &writer.interface);
-    try writer.flush();
+    const download = version.downloads.client;
+    const file = try http.pathsToFile(io, download.size, &.{ paths.versions, version_id, version_id }, ".jar");
+    defer file.file.close(io);
+    if (file.download) {
+        node.increaseEstimatedTotalItems(1);
+        http.download(io, client, download.url, download.sha1, file.file) catch |err| {
+            std.log.err("failed to download client: {t}", .{err});
+            return;
+        };
+        node.completeOne();
+    }
 }
-
-// ---------------------------------------------------------------------
-// Libraries + natives
-// ---------------------------------------------------------------------
 
 const currentOsName: OsName = switch (builtin.os.tag) {
     .windows => .windows,
@@ -142,26 +107,27 @@ fn libraryAllowed(lib: Library) bool {
     return allowed;
 }
 
-fn resolveArchPlaceholder(buf: []u8, raw: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, raw, "${arch}")) |idx| {
-        const before = raw[0..idx];
-        const after = raw[idx + "${arch}".len ..];
-        return std.fmt.bufPrint(buf, "{s}64{s}", .{ before, after }) catch raw;
-    }
-    return raw;
-}
-
 pub fn ensureLibraries(
     io: Io,
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    node: std.Progress.Node,
     client: *std.http.Client,
     paths: *Paths,
     version: Package,
-) !std.ArrayList([]const u8) {
+) ![]const []const u8 {
+    const lib_node = node.start("Downloading libs", version.libraries.len);
     var classpath: std.ArrayList([]const u8) = .empty;
+    var group: Io.Group = .init;
 
+    const dir = try Io.Dir.cwd().createDirPathOpen(io, paths.natives_root, .{});
+    defer dir.close(io);
+    const java_dir = try dir.createDirPathOpen(io, "java", .{});
+    defer java_dir.close(io);
     for (version.libraries) |lib| {
-        if (!libraryAllowed(lib)) continue;
+        if (!libraryAllowed(lib)) {
+            lib_node.completeOne();
+            continue;
+        }
 
         const artifact = if (lib.downloads.classifiers) |classifiers|
             if (switch (currentOsName) {
@@ -171,127 +137,134 @@ pub fn ensureLibraries(
             }) |name| classifiers.map.get(name) else null
         else
             lib.downloads.artifact;
-        const libs_dir = try Io.Dir.cwd().createDirPathOpen(io, paths.libraries, .{});
-        defer libs_dir.close(io);
 
         if (artifact) |art| {
-            const file_dir = if (Io.Dir.path.dirname(art.path)) |parent| try libs_dir.createDirPathOpen(io, parent, .{}) else null;
-            defer if (file_dir) |d| d.close(io);
-
-            const file: ?Io.File = (file_dir orelse libs_dir).createFile(io, Io.Dir.path.basename(art.path), .{ .read = true, .exclusive = true }) catch |err| switch (err) {
-                error.PathAlreadyExists => null,
-                else => |e| return e,
-            };
-            defer if (file) |f| f.close(io);
-            if (file) |f| {
-                var buf: [1024]u8 = undefined;
-                var writer = f.writer(io, &buf);
-                std.log.info("Downloading library: {s}", .{lib.name});
-                try http.downloadToFile(client, art.url, art.sha1, &writer.interface);
-                try writer.flush();
-            }
-
             const looks_like_natives_for_us = std.mem.containsAtLeast(u8, lib.name, 1, ":natives-") and
                 std.mem.containsAtLeast(u8, lib.name, 1, @tagName(currentOsName));
-            if (looks_like_natives_for_us or lib.downloads.classifiers != null) {
-                if (file) |f| {
-                    const dir = try Io.Dir.cwd().createDirPathOpen(io, paths.natives_root, .{});
-                    defer dir.close(io);
-                    const java_dir = try dir.createDirPathOpen(io, "java", .{});
-                    defer java_dir.close(io);
-                    var buf: [1024]u8 = undefined;
-                    var reader = f.reader(io, &buf);
-                    var iter = try std.zip.Iterator.init(&reader);
-                    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
-                    while (try iter.next()) |item| {
-                        try reader.seekTo(item.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
-                        const filename = filename_buf[0..item.filename_len];
-                        try reader.interface.readSliceAll(filename);
-                        if (!std.mem.startsWith(u8, filename, "META-INF"))
-                            try item.extract(&reader, .{}, &filename_buf, java_dir);
-                    }
-                }
+            const native = looks_like_natives_for_us or lib.downloads.classifiers != null;
+            const file = try http.pathsToFile(io, art.size, &.{ paths.libraries, art.path }, "");
+            if (file.download or native) {
+                group.async(io, downloadLib, .{
+                    io,
+                    client,
+                    art.url,
+                    art.sha1,
+                    file.file,
+                    lib_node,
+                    java_dir,
+                    file.download,
+                    native,
+                });
             } else {
-                try classpath.append(allocator, art.path);
+                file.file.close(io);
+                lib_node.completeOne();
             }
+
+            if (!native) {
+                try classpath.append(gpa, art.path);
+            }
+        } else {
+            lib_node.completeOne();
         }
     }
+    try group.await(io);
+    lib_node.end();
 
-    return classpath;
+    return classpath.toOwnedSlice(gpa);
 }
-
-// ---------------------------------------------------------------------
-// Assets
-// ---------------------------------------------------------------------
+fn extractNativeLib(io: Io, file: Io.File, dir: Io.Dir) !void {
+    var buf: [1024]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    var iter = try std.zip.Iterator.init(&reader);
+    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (try iter.next()) |item| {
+        try reader.seekTo(item.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const filename = filename_buf[0..item.filename_len];
+        try reader.interface.readSliceAll(filename);
+        if (!std.mem.startsWith(u8, filename, "META-INF"))
+            item.extract(&reader, .{}, &filename_buf, dir) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => |e| return e,
+            };
+    }
+}
+fn downloadLib(
+    io: Io,
+    client: *std.http.Client,
+    url: []const u8,
+    sha1: []const u8,
+    file: Io.File,
+    node: std.Progress.Node,
+    dir: Io.Dir,
+    download: bool,
+    extract: bool,
+) void {
+    defer file.close(io);
+    if (download) http.download(io, client, url, sha1, file) catch |err| {
+        std.log.err("failed to download lib: {t}", .{err});
+        return;
+    };
+    if (extract) extractNativeLib(io, file, dir) catch |err|
+        std.log.err("Got error {t} while extracting natives", .{err});
+    node.completeOne();
+}
 
 pub fn ensureAssets(
     io: Io,
     gpa: std.mem.Allocator,
+    node: std.Progress.Node,
     client: *std.http.Client,
     paths: *Paths,
     version: Package,
 ) !void {
     const asset_index = version.assetIndex;
 
-    const indexes_dir = try std.fs.path.join(gpa, &.{ paths.assets, "indexes" });
-    defer gpa.free(indexes_dir);
-
-    const index_dir = try Io.Dir.cwd().createDirPathOpen(io, indexes_dir, .{});
-    defer index_dir.close(io);
-    const index_file_name = try std.fmt.allocPrint(gpa, "{s}.json", .{asset_index.id});
-    defer gpa.free(index_file_name);
-    const file = index_dir.createFile(io, index_file_name, .{ .read = true, .exclusive = true }) catch |err| switch (err) {
-        error.PathAlreadyExists => return,
-        else => |e| return e,
-    };
-    defer file.close(io);
+    const files = try http.pathsToFile(io, asset_index.size, &.{ paths.assets, "indexes", asset_index.id }, ".json");
+    if (files.download) {
+        try http.download(io, client, asset_index.url, asset_index.sha1, files.file);
+    }
+    const file = files.file;
     var buf: [1024]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    std.log.info("Downloading asset index: {s}", .{asset_index.id});
-    try http.downloadToFile(client, asset_index.url, asset_index.sha1, &writer.interface);
-    try writer.flush();
-
     var reader = file.reader(io, &buf);
     var json_reader = std.json.Reader.init(gpa, &reader.interface);
     defer json_reader.deinit();
 
     const parsed = try std.json.parseFromTokenSource(struct { objects: std.json.ArrayHashMap(struct { hash: []const u8, size: u32 }) }, gpa, &json_reader, .{});
     defer parsed.deinit();
+    const asset_node = node.start("Downloading assets", parsed.value.objects.map.entries.len);
 
-    const objects = parsed.value.objects.map;
-
-    const objects_dir = try std.fs.path.join(gpa, &.{ paths.assets, "objects" });
-    defer gpa.free(objects_dir);
-    const object_dir = try Io.Dir.cwd().createDirPathOpen(io, objects_dir, .{});
-    defer object_dir.close(io);
-
-    var it = objects.iterator();
-    var count: usize = 0;
+    var group: Io.Group = .init;
+    var it = parsed.value.objects.map.iterator();
     while (it.next()) |entry| {
         const hash = entry.value_ptr.hash;
-        const sub_dir = try object_dir.createDirPathOpen(io, hash[0..2], .{});
-        defer sub_dir.close(io);
 
-        const object_file = sub_dir.createFile(io, hash, .{ .read = true, .exclusive = true }) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => |e| return e,
-        };
-        defer object_file.close(io);
-        var writer_buf: [1024]u8 = undefined;
-        var object_writer = object_file.writer(io, &writer_buf);
-        const url = try std.fmt.allocPrint(gpa, "https://resources.download.minecraft.net/{s}/{s}", .{ hash[0..2], hash });
-        defer gpa.free(url);
-        try http.downloadToFile(client, url, hash, &object_writer.interface);
-        try object_writer.flush();
-
-        count += 1;
-        if (count % 200 == 0) std.log.info("Downloaded {d} assets so far...", .{count});
+        const file_ = try http.pathsToFile(io, entry.value_ptr.size, &.{ paths.assets, "objects", hash[0..2], hash }, "");
+        if (file_.download) {
+            group.async(io, downloadAsset, .{ io, client, hash, file_.file, asset_node });
+        } else {
+            asset_node.completeOne();
+        }
     }
+    try group.await(io);
+    asset_node.end();
 }
 
-// ---------------------------------------------------------------------
-// Launch
-// ---------------------------------------------------------------------
+fn downloadAsset(
+    io: Io,
+    client: *std.http.Client,
+    sha1: []const u8,
+    file: Io.File,
+    node: std.Progress.Node,
+) void {
+    defer file.close(io);
+    var buf: [1024]u8 = undefined;
+    const url = std.fmt.bufPrint(&buf, "https://resources.download.minecraft.net/{s}/{s}", .{ sha1[0..2], sha1 }) catch unreachable;
+    http.download(io, client, url, sha1, file) catch |err| {
+        std.log.err("failed to download lib: {t}", .{err});
+        return;
+    };
+    node.completeOne();
+}
 
 pub fn launch(
     io: Io,
@@ -413,7 +386,7 @@ const Downloads = struct {
     server_mappings: ?Download = null,
     windows_server: ?Download = null,
 };
-const Package = struct {
+pub const Package = struct {
     arguments: ?struct {
         @"default-user-jvm": ?[]const std.json.Value = null,
         game: []const std.json.Value,
