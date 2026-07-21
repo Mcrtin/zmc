@@ -1,48 +1,12 @@
-{
-  pkgs ? import <nixpkgs> { },
-}:
-
-pkgs.mkShell {
-  name = "minecraft-dev-env";
-
-  nativeBuildInputs = [
-    pkgs.openjdk25
-  ];
-
-  buildInputs = with pkgs; [
-    vulkan-loader
-    vulkan-validation-layers
-    libGL
-    # libX11
-    # libXext
-    # libXcursor
-    # libXrandr
-    # libXxf86vm
-    glfw
-    openal
-    udev
-    pulseaudio
-    (lib.getLib stdenv.cc.cc)
-  ];
-
-  shellHook = ''
-    export LD_LIBRARY_PATH=${
-      pkgs.lib.makeLibraryPath [
-        pkgs.vulkan-loader
-        pkgs.vulkan-validation-layers
-        pkgs.libGL
-        # pkgs.libX11
-        # pkgs.libXext
-        # pkgs.libXcursor
-        # pkgs.libXrandr
-        # pkgs.libXxf86vm
-        pkgs.glfw
-        pkgs.openal
-        pkgs.udev
-        pkgs.pulseaudio
-        (pkgs.lib.getLib pkgs.stdenv.cc.cc)
-        pkgs.xorg.libXrender
-      ]
-    }:$LD_LIBRARY_PATH
-  '';
-}
+(import
+  (
+    let
+      flake-compat = (builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.flake-compat;
+    in
+      fetchTarball {
+        url = "https://github.com/edolstra/flake-compat/archive/${flake-compat.locked.rev}.tar.gz";
+        sha256 = flake-compat.locked.narHash;
+      }
+  )
+  {src = ./.;})
+.shellNix
