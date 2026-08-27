@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
 const http = @import("http.zig");
-const Paths = @import("paths.zig").Paths;
+const Paths = @import("Paths.zig");
 
 const MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
@@ -21,37 +21,34 @@ pub const Session = struct {
         allocator.free(self.access_token);
         if (self.refresh_token) |t| allocator.free(t);
     }
+
+    pub fn offline(allocator: std.mem.Allocator, name: []const u8) !Session {
+        var md5 = std.crypto.hash.Md5.init(.{});
+        md5.update("OfflinePlayer:");
+        md5.update(name);
+        var digest: [16]u8 = undefined;
+        md5.final(&digest);
+
+        digest[6] = (digest[6] & 0x0F) | 0x30;
+        digest[8] = (digest[8] & 0x3F) | 0x80;
+
+        const uuid_str = try std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+            digest[0],  digest[1],  digest[2],  digest[3],
+            digest[4],  digest[5],  digest[6],  digest[7],
+            digest[8],  digest[9],  digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15],
+        });
+
+        return Session{
+            .username = try allocator.dupe(u8, name),
+            .uuid = uuid_str,
+            .access_token = try allocator.dupe(u8, "0"),
+            .xuid = try allocator.dupe(u8, "0"),
+            .user_type = .legacy,
+            .refresh_token = null,
+        };
+    }
 };
-
-/// Offline/singleplayer session. Mirrors the real game's offline UUID
-/// derivation (MD5 of "OfflinePlayer:<name>", RFC4122 v3-style bit twiddle)
-/// so the same name always maps to the same UUID, same as vanilla servers do.
-pub fn offlineSession(allocator: std.mem.Allocator, name: []const u8) !Session {
-    var md5 = std.crypto.hash.Md5.init(.{});
-    md5.update("OfflinePlayer:");
-    md5.update(name);
-    var digest: [16]u8 = undefined;
-    md5.final(&digest);
-
-    digest[6] = (digest[6] & 0x0F) | 0x30;
-    digest[8] = (digest[8] & 0x3F) | 0x80;
-
-    const uuid_str = try std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-        digest[0],  digest[1],  digest[2],  digest[3],
-        digest[4],  digest[5],  digest[6],  digest[7],
-        digest[8],  digest[9],  digest[10], digest[11],
-        digest[12], digest[13], digest[14], digest[15],
-    });
-
-    return Session{
-        .username = try allocator.dupe(u8, name),
-        .uuid = uuid_str,
-        .access_token = try allocator.dupe(u8, "0"),
-        .xuid = try allocator.dupe(u8, "0"),
-        .user_type = .legacy,
-        .refresh_token = null,
-    };
-}
 
 pub fn fetchVersionManifest(arena: std.mem.Allocator, client: *std.http.Client) !Manifest {
     return http.requestJson(Manifest, arena, client, manifest_url, &.{}, null);
@@ -142,23 +139,7 @@ pub fn ensureLibraries(
             const looks_like_natives_for_us = std.mem.containsAtLeast(u8, lib.name, 1, ":natives-") and
                 std.mem.containsAtLeast(u8, lib.name, 1, @tagName(currentOsName));
             const native = looks_like_natives_for_us or lib.downloads.classifiers != null;
-            const file = try http.pathsToFile(io, art.size, &.{ paths.libraries, art.path }, "");
-            if (file.download or native) {
-                group.async(io, downloadLib, .{
-                    io,
-                    client,
-                    art.url,
-                    art.sha1,
-                    file.file,
-                    lib_node,
-                    java_dir,
-                    file.download,
-                    native,
-                });
-            } else {
-                file.file.close(io);
-                lib_node.completeOne();
-            }
+            group.async(io, downloadLib, .{ io, client, art.url, art.sha1, lib_node, java_dir, native, paths.libraries, art });
 
             if (!native) {
                 try classpath.append(gpa, art.path);
@@ -193,18 +174,25 @@ fn downloadLib(
     client: *std.http.Client,
     url: []const u8,
     sha1: []const u8,
-    file: Io.File,
     node: std.Progress.Node,
     dir: Io.Dir,
-    download: bool,
     extract: bool,
+    lib_path: []const u8,
+    artifact: Artifact,
 ) void {
-    defer file.close(io);
-    if (download) http.download(io, client, url, sha1, file) catch |err| {
-        std.log.err("failed to download lib: {t}", .{err});
+    const file = http.pathsToFile(io, artifact.size, &.{ lib_path, artifact.path }, "") catch |err| {
+        std.log.err("failed to open asset file: {t}", .{err});
         return;
     };
-    if (extract) extractNativeLib(io, file, dir) catch |err|
+
+    defer file.file.close(io);
+    if (file.download) {
+        http.download(io, client, url, sha1, file.file) catch |err| {
+            std.log.err("failed to download lib: {t}", .{err});
+            return;
+        };
+    }
+    if (extract) extractNativeLib(io, file.file, dir) catch |err|
         std.log.err("Got error {t} while extracting natives", .{err});
     node.completeOne();
 }
@@ -220,49 +208,53 @@ pub fn ensureAssets(
     const asset_index = version.assetIndex;
 
     const files = try http.pathsToFile(io, asset_index.size, &.{ paths.assets, "indexes", asset_index.id }, ".json");
+    const file = files.file;
+    defer file.close(io);
     if (files.download) {
         try http.download(io, client, asset_index.url, asset_index.sha1, files.file);
     }
-    const file = files.file;
     var buf: [1024]u8 = undefined;
     var reader = file.reader(io, &buf);
     var json_reader = std.json.Reader.init(gpa, &reader.interface);
     defer json_reader.deinit();
 
-    const parsed = try std.json.parseFromTokenSource(struct { objects: std.json.ArrayHashMap(struct { hash: []const u8, size: u32 }) }, gpa, &json_reader, .{});
+    const parsed = try std.json.parseFromTokenSource(struct { objects: std.json.ArrayHashMap(Asset) }, gpa, &json_reader, .{});
     defer parsed.deinit();
     const asset_node = node.start("Downloading assets", parsed.value.objects.map.entries.len);
 
     var group: Io.Group = .init;
-    var it = parsed.value.objects.map.iterator();
-    while (it.next()) |entry| {
-        const hash = entry.value_ptr.hash;
-
-        const file_ = try http.pathsToFile(io, entry.value_ptr.size, &.{ paths.assets, "objects", hash[0..2], hash }, "");
-        if (file_.download) {
-            group.async(io, downloadAsset, .{ io, client, hash, file_.file, asset_node });
-        } else {
-            asset_node.completeOne();
-        }
+    for (parsed.value.objects.map.values()) |asset| {
+        group.async(io, downloadAsset, .{ io, client, asset, paths.assets, asset_node });
     }
     try group.await(io);
     asset_node.end();
 }
 
+const Asset = struct { hash: []const u8, size: u32 };
+
 fn downloadAsset(
     io: Io,
     client: *std.http.Client,
-    sha1: []const u8,
-    file: Io.File,
+    asset: Asset,
+    asset_path: []const u8,
     node: std.Progress.Node,
 ) void {
-    defer file.close(io);
     var buf: [1024]u8 = undefined;
-    const url = std.fmt.bufPrint(&buf, "https://resources.download.minecraft.net/{s}/{s}", .{ sha1[0..2], sha1 }) catch unreachable;
-    http.download(io, client, url, sha1, file) catch |err| {
-        std.log.err("failed to download lib: {t}", .{err});
+    const file = http.pathsToFile(io, asset.size, &.{ asset_path, "objects", asset.hash[0..2], asset.hash }, "") catch |err| {
+        std.log.err("failed to open asset file: {t}", .{err});
         return;
     };
+    defer file.file.close(io);
+    if (file.download) {
+        const url = std.fmt.bufPrint(&buf, "https://resources.download.minecraft.net/{s}/{s}", .{ asset.hash[0..2], asset.hash }) catch {
+            std.log.err("failed create url; hash is too long: {s}", .{asset.hash});
+            return;
+        };
+        http.download(io, client, url, asset.hash, file.file) catch |err| {
+            std.log.err("failed to download asset: {t}", .{err});
+            return;
+        };
+    }
     node.completeOne();
 }
 
@@ -321,7 +313,10 @@ pub fn launch(
 
     std.log.info("Launching Minecraft {s} as {s} with command (accessToken has been redacted):\n{f}", .{ version_id, session.username, std.fmt.Alt([]const []const u8, formatJoin){ .data = argv.items } });
     try std.process.setCurrentPath(io, paths.root);
-    return std.process.replace(io, .{ .argv = argv.items, .expand_arg0 = .expand });
+    switch (std.process.replace(io, .{ .argv = argv.items, .expand_arg0 = .expand })) {
+        error.FileNotFound => std.log.err("unable to find java runtime", .{}),
+        else => |e| return e,
+    }
 }
 
 pub const Features = struct {

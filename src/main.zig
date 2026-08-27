@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const paths_mod = @import("paths.zig");
+const Paths = @import("Paths.zig");
 const mojang = @import("mojang.zig");
 const msa = @import("msa.zig");
 const known_folders = @import("known-folders");
@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     const store = if (cache_path) |c| try SessionStore.init(io, c) else null;
     defer if (store) |s| s.deinit(io);
 
-    var mc_paths = try paths_mod.resolve(io, gpa, init.environ_map);
+    var mc_paths = try Paths.resolve(io, gpa, init.environ_map);
     defer mc_paths.deinit();
     std.log.info("Using Minecraft directory: {s}", .{mc_paths.root});
 
@@ -58,15 +58,15 @@ pub fn main(init: std.process.Init) !void {
 
     const version = try mojang.fetchVersion(init.arena.allocator(), &client, chosen.url);
 
+    var classpath_list: ?[]const []const u8 = null;
+    defer if (classpath_list) |c| gpa.free(c);
+
     var group: Io.Group = .init;
     const node = std.Progress.start(io, .{ .root_name = "downloading minecraft" });
 
     group.async(io, ensureClient, .{ io, node, &client, &mc_paths, chosen.id, version });
-
-    const classpath_list = try mojang.ensureLibraries(io, gpa, node, &client, &mc_paths, version);
-    defer gpa.free(classpath_list);
-
-    try mojang.ensureAssets(io, gpa, node, &client, &mc_paths, version);
+    group.async(io, ensureLibs, .{ io, gpa, node, &client, &mc_paths, version, &classpath_list });
+    group.async(io, ensureAssets, .{ io, gpa, node, &client, &mc_paths, version });
 
     var refresh_token_buf: [1024]u8 = undefined;
     var last_name_buf: [1024]u8 = undefined;
@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
     var session: mojang.Session = if (!offline)
         try msa.authenticate(io, gpa, &client, refresh_token)
     else
-        try mojang.offlineSession(gpa, name.?);
+        try mojang.Session.offline(gpa, name.?);
     if (session.refresh_token) |r| {
         if (store) |s| try s.write(io, session.username, r);
     }
@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         gpa,
         &mc_paths,
         chosen.id,
-        classpath_list,
+        classpath_list orelse return,
         version.assetIndex.id,
         version,
         session,
@@ -106,7 +106,7 @@ pub fn ensureClient(
     io: Io,
     node: std.Progress.Node,
     client: *std.http.Client,
-    paths: *paths_mod.Paths,
+    paths: *Paths,
     version_id: []const u8,
     version: mojang.Package,
 ) void {
@@ -115,6 +115,35 @@ pub fn ensureClient(
         std.log.err("error while downloading client: {t}", .{err});
     };
     client_node.end();
+}
+
+fn ensureLibs(
+    io: Io,
+    gpa: std.mem.Allocator,
+    node: std.Progress.Node,
+    client: *std.http.Client,
+    paths: *Paths,
+    version: mojang.Package,
+    out_class_paths: *?[]const []const u8,
+) void {
+    out_class_paths.* = mojang.ensureLibraries(io, gpa, node, client, paths, version) catch |err| {
+        std.log.err("got error whilest downloading libraries: {t}", .{err});
+        return;
+    };
+}
+
+pub fn ensureAssets(
+    io: Io,
+    gpa: std.mem.Allocator,
+    node: std.Progress.Node,
+    client: *std.http.Client,
+    paths: *Paths,
+    version: mojang.Package,
+) void {
+    mojang.ensureAssets(io, gpa, node, client, paths, version) catch |err| {
+        std.log.err("got error whilest downloading assets: {t}", .{err});
+        return;
+    };
 }
 
 fn printHelp() void {

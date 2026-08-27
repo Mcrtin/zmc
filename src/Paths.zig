@@ -3,25 +3,22 @@ const Io = std.Io;
 const builtin = @import("builtin");
 const known_folders = @import("known-folders");
 
-/// Resolved on-disk layout for a Minecraft installation, mirroring what the
-/// official launcher uses so tools/mods that expect the standard layout
-/// keep working.
-pub const Paths = struct {
-    allocator: std.mem.Allocator,
-    root: []const u8,
-    versions: []const u8,
-    libraries: []const u8,
-    assets: []const u8,
-    natives_root: []const u8,
+const Paths = @This();
 
-    pub fn deinit(self: *Paths) void {
-        self.allocator.free(self.root);
-        self.allocator.free(self.versions);
-        self.allocator.free(self.libraries);
-        self.allocator.free(self.assets);
-        self.allocator.free(self.natives_root);
-    }
-};
+allocator: std.mem.Allocator,
+root: []const u8,
+versions: []const u8,
+libraries: []const u8,
+assets: []const u8,
+natives_root: []const u8,
+
+pub fn deinit(self: *Paths) void {
+    self.allocator.free(self.root);
+    self.allocator.free(self.versions);
+    self.allocator.free(self.libraries);
+    self.allocator.free(self.assets);
+    self.allocator.free(self.natives_root);
+}
 
 fn defaultRoot(io: Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
     switch (builtin.os.tag) {

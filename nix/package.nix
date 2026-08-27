@@ -15,7 +15,11 @@
 
   libGL,
 
-  xorg,
+  libX11,
+  libXcursor,
+  libXext,
+  libXrandr,
+  libXxf86vm,
 
   udev,
   vulkan-loader,
@@ -45,11 +49,11 @@ stdenv.mkDerivation {
 
     libGL
 
-    xorg.libX11
-    xorg.libXcursor
-    xorg.libXext
-    xorg.libXrandr
-    xorg.libXxf86vm
+    libX11
+    libXcursor
+    libXext
+    libXrandr
+    libXxf86vm
 
     udev
     vulkan-loader
@@ -74,11 +78,11 @@ stdenv.mkDerivation {
           libpulseaudio
           pipewire
           libGL
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXext
-          xorg.libXrandr
-          xorg.libXxf86vm
+          libX11
+          libXcursor
+          libXext
+          libXrandr
+          libXxf86vm
           udev
           vulkan-loader
         ]
