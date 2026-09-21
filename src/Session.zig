@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
-const http = @import("http.zig");
 const mojang = @import("mojang.zig");
 const Allocator = std.mem.Allocator;
 const known_folders = @import("known-folders");
@@ -176,14 +175,14 @@ fn msAuth(io: Io, alloc: Allocator, client: *std.http.Client, refresh_token: ?[]
             .{ client_id, t, scope },
         );
         std.log.info("Refreshing authentication", .{});
-        const ms_token = try http.requestJson(MsToken, alloc, client, token_url, &form_headers, body);
+        const ms_token = try requestJson(MsToken, alloc, client, token_url, &form_headers, body);
         if (ms_token.access_token != null) return ms_token;
         std.log.warn("Refresh failed, trying to reauthenticate", .{});
     }
     std.log.info("Requesting authentication code", .{});
     const device_body = "client_id=" ++ client_id ++ "&scope=" ++ scope;
     const device_code_url = std.Uri.parse("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode") catch unreachable;
-    const device = try http.requestJson(DeviceCodeResponse, alloc, client, device_code_url, &form_headers, device_body);
+    const device = try requestJson(DeviceCodeResponse, alloc, client, device_code_url, &form_headers, device_body);
 
     std.log.info("Opening {s}. enter code: {s}", .{ device.verification_uri, device.user_code });
     openUrl(io, alloc, device.verification_uri) catch {};
@@ -198,7 +197,7 @@ fn msAuth(io: Io, alloc: Allocator, client: *std.http.Client, refresh_token: ?[]
     while (attempts > 0) : (attempts -= 1) {
         try io.sleep(.fromSeconds(device.interval), .boot);
         std.log.info("Poking authentication", .{});
-        const t = try http.requestJson(MsToken, alloc, client, token_url, &form_headers, ms_body);
+        const t = try requestJson(MsToken, alloc, client, token_url, &form_headers, ms_body);
 
         if (t.access_token != null) return t;
 
@@ -227,7 +226,7 @@ fn xboxAuth(alloc: Allocator, client: *std.http.Client, ms_token: MsToken) !XblT
     );
 
     const url = std.Uri.parse("https://user.auth.xboxlive.com/user/authenticate") catch unreachable;
-    return try http.requestJson(XblToken, alloc, client, url, &json_headers, xbl_body);
+    return try requestJson(XblToken, alloc, client, url, &json_headers, xbl_body);
 }
 
 fn xstsAuth(alloc: Allocator, client: *std.http.Client, xbox_token: XblToken) !XstsToken {
@@ -240,7 +239,7 @@ fn xstsAuth(alloc: Allocator, client: *std.http.Client, xbox_token: XblToken) !X
     );
 
     const url = std.Uri.parse("https://xsts.auth.xboxlive.com/xsts/authorize") catch unreachable;
-    return try http.requestJson(XstsToken, alloc, client, url, &json_headers, xsts_body);
+    return try requestJson(XstsToken, alloc, client, url, &json_headers, xsts_body);
 }
 
 fn login(alloc: Allocator, client: *std.http.Client, xsts_token: XstsToken) !Account {
@@ -253,7 +252,7 @@ fn login(alloc: Allocator, client: *std.http.Client, xsts_token: XstsToken) !Acc
     );
 
     const url = std.Uri.parse("https://api.minecraftservices.com/authentication/login_with_xbox") catch unreachable;
-    return try http.requestJson(Account, alloc, client, url, &json_headers, login_body);
+    return try requestJson(Account, alloc, client, url, &json_headers, login_body);
 }
 
 fn getProfile(alloc: Allocator, client: *std.http.Client, account: Account) !Profile {
@@ -263,7 +262,33 @@ fn getProfile(alloc: Allocator, client: *std.http.Client, account: Account) !Pro
     };
 
     const url = std.Uri.parse("https://api.minecraftservices.com/minecraft/profile") catch unreachable;
-    return try http.requestJson(Profile, alloc, client, url, &profile_headers, null);
+    return try requestJson(Profile, alloc, client, url, &profile_headers, null);
+}
+
+pub fn requestJson(T: type, arena: std.mem.Allocator, client: *std.http.Client, url: std.Uri, headers: []const std.http.Header, payload: ?[]const u8) !T {
+    var req = try client.request(if (payload == null) .GET else .POST, url, .{ .extra_headers = headers });
+    defer req.deinit();
+
+    if (payload) |p| {
+        req.transfer_encoding = .{ .content_length = p.len };
+        var body = try req.sendBodyUnflushed(&.{});
+
+        try body.writer.writeAll(p);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    var transfer_buf: [64]u8 = undefined;
+    var compress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buf, &decompress, &compress_buf);
+    var r = std.json.Reader.init(arena, reader);
+    return std.json.parseFromTokenSourceLeaky(T, arena, &r, .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
 }
 
 fn openUrl(io: Io, gpa: std.mem.Allocator, url: []const u8) !void {

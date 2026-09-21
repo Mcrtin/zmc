@@ -1,7 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
-const http = @import("http.zig");
 const Paths = @import("Paths.zig");
 const Session = @import("Session.zig");
 const Allocator = std.mem.Allocator;
@@ -9,11 +8,11 @@ const Allocator = std.mem.Allocator;
 const MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
 pub fn fetchVersionManifest(arena: std.mem.Allocator, client: *std.http.Client) !Manifest {
-    return http.requestJson(Manifest, arena, client, manifest_url, &.{}, null);
+    return Session.requestJson(Manifest, arena, client, manifest_url, &.{}, null);
 }
 
 pub fn fetchVersion(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) !Package {
-    return http.requestJson(Package, arena, client, try std.Uri.parse(url), &.{}, null);
+    return Session.requestJson(Package, arena, client, try std.Uri.parse(url), &.{}, null);
 }
 
 pub fn ensureClient(
@@ -22,19 +21,12 @@ pub fn ensureClient(
     client: *std.http.Client,
     paths: *Paths,
     version_id: []const u8,
-    version: Package,
+    client_download: Download,
 ) !void {
-    const download = version.downloads.client;
-    const file = try http.pathsToFile(io, download.size, &.{ paths.versions, version_id, version_id }, ".jar");
-    defer file.file.close(io);
-    if (file.download) {
-        node.increaseEstimatedTotalItems(1);
-        http.download(io, client, download.url, download.sha1, file.file) catch |err| {
-            std.log.err("failed to download client: {t}", .{err});
-            return;
-        };
-        node.completeOne();
-    }
+    node.increaseEstimatedTotalItems(1);
+    const file = try obtainFile(io, client, client_download.url, client_download.sha1, client_download.size, &.{ paths.versions, version_id, version_id }, ".jar");
+    file.close(io);
+    node.completeOne();
 }
 
 const os_name: OsName = switch (builtin.os.tag) {
@@ -54,13 +46,13 @@ pub fn ensureLibraries(
     io: Io,
     node: std.Progress.Node,
     client: *std.http.Client,
-    paths: *Paths,
-    version: Package,
+    lib_path: []const u8,
+    libraries: []const Library,
 ) Io.Cancelable!void {
-    const lib_node = node.start("Downloading libs", version.libraries.len);
+    const lib_node = node.start("Downloading libs", libraries.len);
     var group: Io.Group = .init;
 
-    for (version.libraries) |lib| {
+    for (libraries) |lib| {
         const art = lib.artifact() catch |err| switch (err) {
             error.MissingArtifact => {
                 std.log.warn("library {s} is missing an artifact", .{lib.name});
@@ -74,15 +66,15 @@ pub fn ensureLibraries(
             },
         };
 
-        group.async(io, downloadLib, .{ io, client, art.url, art.sha1, lib_node, paths.libraries, art });
+        group.async(io, downloadLib, .{ io, client, lib_node, lib_path, art });
     }
     try group.await(io);
     lib_node.end();
 }
 
-pub fn getClasspath(alloc: Allocator, version: Package) Allocator.Error![]const []const u8 {
-    var classpath: std.ArrayList([]const u8) = try .initCapacity(alloc, version.libraries.len);
-    for (version.libraries) |lib|
+pub fn getClasspath(alloc: Allocator, libs: []const Library) Allocator.Error![]const []const u8 {
+    var classpath: std.ArrayList([]const u8) = try .initCapacity(alloc, libs.len);
+    for (libs) |lib|
         classpath.appendAssumeCapacity((lib.artifact() catch continue).path);
     return classpath.toOwnedSlice(alloc);
 }
@@ -90,56 +82,48 @@ pub fn getClasspath(alloc: Allocator, version: Package) Allocator.Error![]const 
 fn downloadLib(
     io: Io,
     client: *std.http.Client,
-    url: []const u8,
-    sha1: []const u8,
     node: std.Progress.Node,
     lib_path: []const u8,
     artifact: Artifact,
 ) void {
-    const file = http.pathsToFile(io, artifact.size, &.{ lib_path, artifact.path }, "") catch |err| {
-        std.log.err("failed to open asset file: {t}", .{err});
+    const file = obtainFile(io, client, artifact.url, artifact.sha1, artifact.size, &.{ lib_path, artifact.path }, "") catch |err| {
+        std.log.err("failed to download lib: {t}", .{err});
         return;
     };
-
-    defer file.file.close(io);
-    if (file.download) {
-        http.download(io, client, url, sha1, file.file) catch |err| {
-            std.log.err("failed to download lib: {t}", .{err});
-            return;
-        };
-    }
+    file.close(io);
 
     node.completeOne();
 }
 
-pub fn ensureAssets(
+pub const AssetIndex = struct { objects: std.json.ArrayHashMap(Asset) };
+pub fn getAssetIndex(
     io: Io,
-    gpa: std.mem.Allocator,
-    node: std.Progress.Node,
+    arena: Allocator,
     client: *std.http.Client,
-    paths: *Paths,
-    version: Package,
-) !void {
-    const asset_index = version.assetIndex;
-
-    const files = try http.pathsToFile(io, asset_index.size, &.{ paths.assets, "indexes", asset_index.id }, ".json");
-    const file = files.file;
-    defer file.close(io);
-    if (files.download) {
-        try http.download(io, client, asset_index.url, asset_index.sha1, files.file);
-    }
+    assets_path: []const u8,
+    asset_index: Package.AssetIndexDownload,
+) !AssetIndex {
+    const file = try obtainFile(io, client, asset_index.url, asset_index.sha1, asset_index.size, &.{ assets_path, "indexes", asset_index.id }, ".json");
     var buf: [1024]u8 = undefined;
     var reader = file.reader(io, &buf);
-    var json_reader = std.json.Reader.init(gpa, &reader.interface);
+    var json_reader = std.json.Reader.init(arena, &reader.interface);
     defer json_reader.deinit();
 
-    const parsed = try std.json.parseFromTokenSource(struct { objects: std.json.ArrayHashMap(Asset) }, gpa, &json_reader, .{});
-    defer parsed.deinit();
-    const asset_node = node.start("Downloading assets", parsed.value.objects.map.entries.len);
+    return try std.json.parseFromTokenSourceLeaky(AssetIndex, arena, &json_reader, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+}
+
+pub fn ensureAssets(
+    io: Io,
+    node: std.Progress.Node,
+    client: *std.http.Client,
+    assets_path: []const u8,
+    assets: []const Asset,
+) !void {
+    const asset_node = node.start("Downloading assets", assets.len);
 
     var group: Io.Group = .init;
-    for (parsed.value.objects.map.values()) |asset| {
-        group.async(io, downloadAsset, .{ io, client, asset, paths.assets, asset_node });
+    for (assets) |asset| {
+        group.async(io, downloadAsset, .{ io, client, asset, assets_path, asset_node });
     }
     try group.await(io);
     asset_node.end();
@@ -154,28 +138,66 @@ fn downloadAsset(
     asset_path: []const u8,
     node: std.Progress.Node,
 ) void {
-    var buf: [1024]u8 = undefined;
-    const file = http.pathsToFile(io, asset.size, &.{ asset_path, "objects", asset.hash[0..2], &asset.hash }, "") catch |err| {
-        std.log.err("failed to open asset file: {t}", .{err});
+    var buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&buf, "https://resources.download.minecraft.net/{s}/{s}", .{ asset.hash[0..2], asset.hash }) catch unreachable;
+    const file = obtainFile(io, client, url, &asset.hash, asset.size, &.{ asset_path, "objects", asset.hash[0..2], &asset.hash }, "") catch |err| {
+        std.log.err("failed to download asset: {t}", .{err});
         return;
     };
-    defer file.file.close(io);
-    if (file.download) {
-        const url = std.fmt.bufPrint(&buf, "https://resources.download.minecraft.net/{s}/{s}", .{ asset.hash[0..2], asset.hash }) catch {
-            std.log.err("failed create url; hash is too long: {s}", .{asset.hash});
-            return;
-        };
-        http.download(io, client, url, &asset.hash, file.file) catch |err| {
-            std.log.err("failed to download asset: {t}", .{err});
-            return;
-        };
-    }
+    file.close(io);
     node.completeOne();
+}
+
+fn obtainFile(
+    io: Io,
+    client: *std.http.Client,
+    url: []const u8,
+    sha1: []const u8,
+    size: u64,
+    paths: []const []const u8,
+    suffix: []const u8,
+) !Io.File {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{f}{s}", .{ std.fs.path.fmtJoin(paths), suffix });
+    const dir_path = Io.Dir.path.dirname(path).?;
+    const file_name = Io.Dir.path.basename(path);
+
+    const dir = try Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+    defer dir.close(io);
+    const final: ?Io.File = dir.openFile(io, file_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => |e| return e,
+    };
+    if (final) |f| {
+        errdefer f.close(io);
+        if (try f.length(io) == size) return f else f.close(io);
+    }
+
+    const file = try dir.createFile(io, file_name, .{ .read = true });
+    errdefer file.close(io);
+    var buf: [1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    var hash_buf: [1024]u8 = undefined;
+    var hasher: std.crypto.hash.Sha1 = .init(.{});
+    var hashing_writer = writer.interface.hashed(&hasher, &hash_buf);
+    const res = try client.fetch(.{ .response_writer = &hashing_writer.writer, .location = .{ .url = url } });
+    try hashing_writer.writer.flush();
+    try writer.flush();
+    var print_buf: [std.crypto.hash.Sha1.digest_length * 4]u8 = undefined;
+    const sha1_res = std.fmt.bufPrint(&print_buf, "{x}", .{hashing_writer.hasher.finalResult()}) catch unreachable;
+
+    if (res.status.class() != .success) return error.DownloadError;
+    if (try file.length(io) != size) return error.LenghtMismatch;
+    if (!std.mem.eql(u8, sha1, sha1_res)) {
+        std.log.err("hash mismatch: got: {s} expected: {s}", .{ sha1_res, sha1 });
+        return error.ChecksumMismatch;
+    }
+    return file;
 }
 
 pub fn launch(
     io: Io,
-    gpa: std.mem.Allocator,
+    gpa: Allocator,
     paths: *Paths,
     version_id: []const u8,
     libs_classpath: []const []const u8,
@@ -261,8 +283,6 @@ const Rule = struct {
     } = null,
 };
 
-const VersionType = enum { snapshot, release, old_alpha, old_beta };
-const VersionData = struct { id: []const u8, type: VersionType, url: []const u8, time: []const u8, releaseTime: []const u8 };
 const OsName = enum { osx, windows, linux };
 const Arch = enum { x86, x64 };
 const Artifact = struct {
@@ -332,12 +352,12 @@ pub const Package = struct {
         jvm: []const std.json.Value,
     } = null,
     minecraftArguments: ?[]const u8 = null,
-    assetIndex: struct { id: []const u8, sha1: []const u8, size: u32, totalSize: u32, url: []const u8 },
+    assetIndex: AssetIndexDownload,
     assets: []const u8,
     complianceLevel: ?u8 = null,
     downloads: Downloads,
     javaVersion: ?struct { component: []const u8, majorVersion: u8 } = null,
-    libraries: []Library,
+    libraries: []const Library,
     logging: ?struct {
         client: struct {
             argument: []const u8,
@@ -365,10 +385,15 @@ pub const Package = struct {
         server_mappings: ?Download = null,
         windows_server: ?Download = null,
     };
+
+    const AssetIndexDownload = struct { id: []const u8, sha1: []const u8, size: u32, totalSize: u32, url: []const u8 };
 };
+const VersionType = enum { snapshot, release, old_alpha, old_beta };
 const Manifest = struct {
     latest: struct { release: []const u8, snapshot: []const u8 },
-    versions: []VersionData,
+    versions: []const VersionsDownload,
+
+    const VersionsDownload = struct { id: []const u8, type: VersionType, url: []const u8, time: []const u8, releaseTime: []const u8 };
 };
 const manifest_url = std.Uri.parse("https://launchermeta.mojang.com/mc/game/version_manifest.json") catch unreachable;
 
@@ -532,9 +557,9 @@ test "json parsing" {
     const io = std.testing.io;
     var client = std.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
-    const manifest = try http.requestJson(Manifest, arena.allocator(), &client, manifest_url, &.{}, null);
+    const manifest = try Session.requestJson(Manifest, arena.allocator(), &client, manifest_url, &.{}, null);
     for (manifest.versions) |v| {
-        const value = try http.requestJson(Package, arena.allocator(), &client, try std.Uri.parse(v.url), &.{}, null);
+        const value = try Session.requestJson(Package, arena.allocator(), &client, try std.Uri.parse(v.url), &.{}, null);
         _ = value;
     }
 }

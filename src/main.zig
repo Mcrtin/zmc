@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     const node = std.Progress.start(io, .{ .root_name = "downloading minecraft" });
 
     group.async(io, ensureClient, .{ io, node, &client, &mc_paths, chosen.id, version });
-    group.async(io, mojang.ensureLibraries, .{ io, node, &client, &mc_paths, version });
+    group.async(io, mojang.ensureLibraries, .{ io, node, &client, mc_paths.libraries, version.libraries });
     group.async(io, ensureAssets, .{ io, gpa, node, &client, &mc_paths, version });
     const cache_path = (try known_folders.getPath(io, gpa, init.environ_map, .cache)).?;
     defer gpa.free(cache_path);
@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         };
     defer session.deinit(gpa);
 
-    const classpath: []const []const u8 = try mojang.getClasspath(gpa, version);
+    const classpath = try mojang.getClasspath(gpa, version.libraries);
     defer gpa.free(classpath);
 
     const features: mojang.Features = .{};
@@ -115,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
         features,
     );
 }
+
 pub fn ensureClient(
     io: Io,
     node: std.Progress.Node,
@@ -124,24 +125,10 @@ pub fn ensureClient(
     version: mojang.Package,
 ) void {
     const client_node = node.start("downloading client", 0);
-    mojang.ensureClient(io, node, client, paths, version_id, version) catch |err| {
+    mojang.ensureClient(io, node, client, paths, version_id, version.downloads.client) catch |err| {
         std.log.err("error while downloading client: {t}", .{err});
     };
     client_node.end();
-}
-
-fn ensureLibs(
-    io: Io,
-    node: std.Progress.Node,
-    client: *std.http.Client,
-    paths: *Paths,
-    version: mojang.Package,
-    out_class_paths: *?[]const []const u8,
-) void {
-    out_class_paths.* = mojang.ensureLibraries(io, node, client, paths, version) catch |err| {
-        std.log.err("got error whilest downloading libraries: {t}", .{err});
-        return;
-    };
 }
 
 pub fn ensureAssets(
@@ -152,7 +139,14 @@ pub fn ensureAssets(
     paths: *Paths,
     version: mojang.Package,
 ) void {
-    mojang.ensureAssets(io, gpa, node, client, paths, version) catch |err| {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+
+    defer arena.deinit();
+    const asset_index = mojang.getAssetIndex(io, arena.allocator(), client, paths.assets, version.assetIndex) catch |err| {
+        std.log.err("got error whilest downloading the asset index: {t}", .{err});
+        return;
+    };
+    mojang.ensureAssets(io, node, client, paths.assets, asset_index.objects.map.values()) catch |err| {
         std.log.err("got error whilest downloading assets: {t}", .{err});
         return;
     };
