@@ -27,7 +27,7 @@ pub fn requestJson(T: type, arena: std.mem.Allocator, client: *std.http.Client, 
     return std.json.parseFromTokenSourceLeaky(T, arena, &r, .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
 }
 
-pub fn pathsToFile(io: Io, size: usize, paths: []const []const u8, suffix: []const u8) !struct { file: Io.File, download: bool } {
+pub fn pathsToFile(io: Io, size: u64, paths: []const []const u8, suffix: []const u8) !struct { file: Io.File, download: bool } {
     var buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{f}{s}", .{ std.fs.path.fmtJoin(paths), suffix });
     const dir_path = Io.Dir.path.dirname(path).?;

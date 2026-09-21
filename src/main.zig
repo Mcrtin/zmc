@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Fetching version manifest", .{});
     const manifest = try mojang.fetchVersionManifest(init.arena.allocator(), &client);
 
-    const target_id = requested_version orelse manifest.latest.release;
+    const target_id = requested_version orelse manifest.latest.release; //TODO: profiles
     const chosen = blk: {
         for (manifest.versions) |v| {
             if (std.mem.eql(u8, v.id, target_id)) break :blk v;
@@ -51,21 +51,19 @@ pub fn main(init: std.process.Init) !void {
 
     const version = try mojang.fetchVersion(init.arena.allocator(), &client, chosen.url);
 
-    var classpath_list: ?[]const []const u8 = null;
-    defer if (classpath_list) |c| gpa.free(c);
-
     var group: Io.Group = .init;
     const node = std.Progress.start(io, .{ .root_name = "downloading minecraft" });
 
     group.async(io, ensureClient, .{ io, node, &client, &mc_paths, chosen.id, version });
-    group.async(io, ensureLibs, .{ io, gpa, node, &client, &mc_paths, version, &classpath_list });
+    group.async(io, mojang.ensureLibraries, .{ io, node, &client, &mc_paths, version });
     group.async(io, ensureAssets, .{ io, gpa, node, &client, &mc_paths, version });
     const cache_path = (try known_folders.getPath(io, gpa, init.environ_map, .cache)).?;
     defer gpa.free(cache_path);
     var token_buf: [4096]u8 = undefined;
+    var last_name_buf: [128]u8 = undefined;
     const session: Session =
         if (offline) try .offline(gpa, name orelse "Player") else blk: {
-            const store = try Session.Store.open(io, cache_path);
+            const store: Session.Store = try .open(io, cache_path);
             if (name) |n| {
                 var it = try store.list();
                 while (try it.next(io)) |acc| {
@@ -83,23 +81,23 @@ pub fn main(init: std.process.Init) !void {
                     break :blk session;
                 }
             } else {
-                var last_name_buf: [128]u8 = undefined;
-                if (try store.last(io, &last_name_buf)) |last| {
-                    const session = try Session.online(io, gpa, &client, try store.read(io, last, &token_buf));
-                    errdefer session.deinit(gpa);
-                    try store.write(io, last, session.refresh_token.?);
-                    break :blk session;
-                } else {
-                    std.log.warn("No last used account present. Authenticating.", .{});
-                    const session = try Session.online(io, gpa, &client, null);
-                    errdefer session.deinit(gpa);
-                    try store.write(io, session.username, session.refresh_token.?);
-                    break :blk session;
-                }
+                const token = if (try store.last(io, &last_name_buf)) |last|
+                    try store.read(io, last, &token_buf)
+                else
+                    null;
+
+                if (token == null) std.log.warn("No last used account present. Authenticating.", .{});
+                const session = try Session.online(io, gpa, &client, token);
+                errdefer session.deinit(gpa);
+                try store.write(io, session.username, session.refresh_token.?);
+                break :blk session;
             }
-            try store.save(io, mc_paths.root);
         };
     defer session.deinit(gpa);
+
+    const classpath: []const []const u8 = try mojang.getClasspath(gpa, version);
+    defer gpa.free(classpath);
+
     const features: mojang.Features = .{};
 
     try group.await(io);
@@ -110,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
         gpa,
         &mc_paths,
         chosen.id,
-        classpath_list orelse return,
+        classpath,
         version.assetIndex.id,
         version,
         session,
@@ -134,14 +132,13 @@ pub fn ensureClient(
 
 fn ensureLibs(
     io: Io,
-    gpa: std.mem.Allocator,
     node: std.Progress.Node,
     client: *std.http.Client,
     paths: *Paths,
     version: mojang.Package,
     out_class_paths: *?[]const []const u8,
 ) void {
-    out_class_paths.* = mojang.ensureLibraries(io, gpa, node, client, paths, version) catch |err| {
+    out_class_paths.* = mojang.ensureLibraries(io, node, client, paths, version) catch |err| {
         std.log.err("got error whilest downloading libraries: {t}", .{err});
         return;
     };

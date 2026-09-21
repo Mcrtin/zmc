@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const http = @import("http.zig");
 const Paths = @import("Paths.zig");
 const Session = @import("Session.zig");
+const Allocator = std.mem.Allocator;
 
 const MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
@@ -14,6 +15,7 @@ pub fn fetchVersionManifest(arena: std.mem.Allocator, client: *std.http.Client) 
 pub fn fetchVersion(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) !Package {
     return http.requestJson(Package, arena, client, try std.Uri.parse(url), &.{}, null);
 }
+
 pub fn ensureClient(
     io: Io,
     node: std.Progress.Node,
@@ -35,105 +37,62 @@ pub fn ensureClient(
     }
 }
 
-const currentOsName: OsName = switch (builtin.os.tag) {
+const os_name: OsName = switch (builtin.os.tag) {
     .windows => .windows,
     .macos => .osx,
     .linux => .linux,
     else => .linux,
 };
-const currentArch: Arch = if (builtin.cpu.arch.isX86())
-    .x86
-else
-    .x64;
 
-fn libraryAllowed(lib: Library) bool {
-    var allowed = false;
-    if (lib.rules.len == 0) return true;
-    for (lib.rules) |rule| {
-        const matches = if (rule.os) |os|
-            (if (os.name) |name|
-                name == currentOsName
-            else if (os.arch) |arch| arch == currentArch else true)
-        else
-            true;
-        if (matches) allowed = rule.action == .allow;
-    }
-    return allowed;
-}
+const currentArch: Arch = switch (builtin.cpu.arch) {
+    .x86 => .x86,
+    .x86_64 => .x64,
+    else => @compileError("unsupported"),
+};
 
 pub fn ensureLibraries(
     io: Io,
-    gpa: std.mem.Allocator,
     node: std.Progress.Node,
     client: *std.http.Client,
     paths: *Paths,
     version: Package,
-) ![]const []const u8 {
+) Io.Cancelable!void {
     const lib_node = node.start("Downloading libs", version.libraries.len);
-    var classpath: std.ArrayList([]const u8) = .empty;
     var group: Io.Group = .init;
 
-    const dir = try Io.Dir.cwd().createDirPathOpen(io, paths.natives_root, .{});
-    defer dir.close(io);
-    const java_dir = try dir.createDirPathOpen(io, "java", .{});
-    defer java_dir.close(io);
     for (version.libraries) |lib| {
-        if (!libraryAllowed(lib)) {
-            lib_node.completeOne();
-            continue;
-        }
+        const art = lib.artifact() catch |err| switch (err) {
+            error.MissingArtifact => {
+                std.log.warn("library {s} is missing an artifact", .{lib.name});
+                lib_node.completeOne();
+                continue;
+            },
+            error.SystemMismatch => {
+                std.log.debug("skipping library {s} due to system missmatch", .{lib.name});
+                lib_node.completeOne();
+                continue;
+            },
+        };
 
-        const artifact = if (lib.downloads.classifiers) |classifiers|
-            if (switch (currentOsName) {
-                .linux => lib.natives.linux,
-                .osx => lib.natives.osx,
-                .windows => lib.natives.windows,
-            }) |name| classifiers.map.get(name) else null
-        else
-            lib.downloads.artifact;
-
-        if (artifact) |art| {
-            const looks_like_natives_for_us = std.mem.containsAtLeast(u8, lib.name, 1, ":natives-") and
-                std.mem.containsAtLeast(u8, lib.name, 1, @tagName(currentOsName));
-            const native = looks_like_natives_for_us or lib.downloads.classifiers != null;
-            group.async(io, downloadLib, .{ io, client, art.url, art.sha1, lib_node, java_dir, native, paths.libraries, art });
-
-            if (!native) {
-                try classpath.append(gpa, art.path);
-            }
-        } else {
-            lib_node.completeOne();
-        }
+        group.async(io, downloadLib, .{ io, client, art.url, art.sha1, lib_node, paths.libraries, art });
     }
     try group.await(io);
     lib_node.end();
+}
 
-    return classpath.toOwnedSlice(gpa);
+pub fn getClasspath(alloc: Allocator, version: Package) Allocator.Error![]const []const u8 {
+    var classpath: std.ArrayList([]const u8) = try .initCapacity(alloc, version.libraries.len);
+    for (version.libraries) |lib|
+        classpath.appendAssumeCapacity((lib.artifact() catch continue).path);
+    return classpath.toOwnedSlice(alloc);
 }
-fn extractNativeLib(io: Io, file: Io.File, dir: Io.Dir) !void {
-    var buf: [1024]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    var iter = try std.zip.Iterator.init(&reader);
-    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
-    while (try iter.next()) |item| {
-        try reader.seekTo(item.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
-        const filename = filename_buf[0..item.filename_len];
-        try reader.interface.readSliceAll(filename);
-        if (!std.mem.startsWith(u8, filename, "META-INF"))
-            item.extract(&reader, .{}, &filename_buf, dir) catch |err| switch (err) {
-                error.PathAlreadyExists => continue,
-                else => |e| return e,
-            };
-    }
-}
+
 fn downloadLib(
     io: Io,
     client: *std.http.Client,
     url: []const u8,
     sha1: []const u8,
     node: std.Progress.Node,
-    dir: Io.Dir,
-    extract: bool,
     lib_path: []const u8,
     artifact: Artifact,
 ) void {
@@ -149,8 +108,7 @@ fn downloadLib(
             return;
         };
     }
-    if (extract) extractNativeLib(io, file.file, dir) catch |err|
-        std.log.err("Got error {t} while extracting natives", .{err});
+
     node.completeOne();
 }
 
@@ -187,7 +145,7 @@ pub fn ensureAssets(
     asset_node.end();
 }
 
-const Asset = struct { hash: []const u8, size: u32 };
+const Asset = struct { hash: [40]u8, size: u64 };
 
 fn downloadAsset(
     io: Io,
@@ -197,7 +155,7 @@ fn downloadAsset(
     node: std.Progress.Node,
 ) void {
     var buf: [1024]u8 = undefined;
-    const file = http.pathsToFile(io, asset.size, &.{ asset_path, "objects", asset.hash[0..2], asset.hash }, "") catch |err| {
+    const file = http.pathsToFile(io, asset.size, &.{ asset_path, "objects", asset.hash[0..2], &asset.hash }, "") catch |err| {
         std.log.err("failed to open asset file: {t}", .{err});
         return;
     };
@@ -207,7 +165,7 @@ fn downloadAsset(
             std.log.err("failed create url; hash is too long: {s}", .{asset.hash});
             return;
         };
-        http.download(io, client, url, asset.hash, file.file) catch |err| {
+        http.download(io, client, url, &asset.hash, file.file) catch |err| {
             std.log.err("failed to download asset: {t}", .{err});
             return;
         };
@@ -318,26 +276,55 @@ const Download = struct {
     size: usize,
     url: []const u8,
 };
-const LibDownloads = struct {
-    artifact: ?Artifact = null,
-    classifiers: ?std.json.ArrayHashMap(Artifact) = null,
-};
 const Library = struct {
-    downloads: LibDownloads,
+    downloads: Downloads,
     name: []const u8,
     natives: struct { linux: ?[]const u8 = null, osx: ?[]const u8 = null, windows: ?[]const u8 = null } = .{},
     extract: ?struct {
         exclude: []const []const u8,
     } = null,
     rules: []const Rule = &.{},
+
+    const Downloads = struct {
+        artifact: ?Artifact = null,
+        classifiers: ?std.json.ArrayHashMap(Artifact) = null,
+    };
+
+    pub fn artifact(lib: Library) error{ SystemMismatch, MissingArtifact }!Artifact {
+        if (!lib.libraryAllowed()) {
+            return error.SystemMismatch;
+        }
+
+        const art = if (lib.downloads.classifiers) |classifiers|
+            if (switch (os_name) {
+                .linux => lib.natives.linux,
+                .osx => lib.natives.osx,
+                .windows => lib.natives.windows,
+            }) |name| classifiers.map.get(name) else {
+                std.log.warn("library {s} missing rule for current system {t}.", .{ lib.name, os_name });
+                return error.SystemMismatch;
+            }
+        else
+            lib.downloads.artifact;
+        return art orelse return error.MissingArtifact;
+    }
+
+    fn libraryAllowed(lib: Library) bool {
+        var allowed = false;
+        if (lib.rules.len == 0) return true;
+        for (lib.rules) |rule| {
+            const matches = if (rule.os) |os|
+                (if (os.name) |name|
+                    name == os_name
+                else if (os.arch) |arch| arch == currentArch else true)
+            else
+                true;
+            if (matches) allowed = rule.action == .allow;
+        }
+        return allowed;
+    }
 };
-const Downloads = struct {
-    client: Download,
-    client_mappings: ?Download = null,
-    server: ?Download = null,
-    server_mappings: ?Download = null,
-    windows_server: ?Download = null,
-};
+
 pub const Package = struct {
     arguments: ?struct {
         @"default-user-jvm": ?[]const std.json.Value = null,
@@ -370,6 +357,14 @@ pub const Package = struct {
     type: VersionType,
     releaseTime: []const u8,
     time: []const u8,
+
+    const Downloads = struct {
+        client: Download,
+        client_mappings: ?Download = null,
+        server: ?Download = null,
+        server_mappings: ?Download = null,
+        windows_server: ?Download = null,
+    };
 };
 const Manifest = struct {
     latest: struct { release: []const u8, snapshot: []const u8 },
@@ -392,7 +387,7 @@ fn formatJoin(slice: []const []const u8, w: *std.Io.Writer) std.Io.Writer.Error!
 
 fn ruleMatches(rule: Rule, features: Features) bool {
     if (rule.os) |os| {
-        if (os.name) |name| return name == currentOsName;
+        if (os.name) |name| return name == os_name;
         if (os.arch) |arch| return arch == currentArch;
     }
     if (rule.features) |feature| {
@@ -491,10 +486,9 @@ fn substituteAll(allocator: std.mem.Allocator, raw: [][]const u8, ctx: SubstCtx)
 }
 
 fn substitutePlaceholder(allocator: std.mem.Allocator, tok: []const u8, ctx: SubstCtx) ![]u8 {
-    const Pair = struct { key: []const u8, val: []const u8 };
     var buf: [4096]u8 = undefined;
     const auth_session = if (ctx.session.access_token.len == 0) "" else try std.fmt.bufPrint(&buf, "token:{s}:{s}", .{ ctx.session.access_token, ctx.session.uuid }); //TODO: uuid simple??
-    const pairs = [_]Pair{
+    const pairs: [19]struct { key: []const u8, val: []const u8 } = .{
         .{ .key = "${auth_player_name}", .val = ctx.session.username },
         .{ .key = "${auth_uuid}", .val = ctx.session.uuid },
         .{ .key = "${auth_access_token}", .val = ctx.session.access_token },
