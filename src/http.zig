@@ -1,6 +1,5 @@
 const Io = std.Io;
 const std = @import("std");
-const msa = @import("msa.zig");
 
 pub fn requestJson(T: type, arena: std.mem.Allocator, client: *std.http.Client, url: std.Uri, headers: []const std.http.Header, payload: ?[]const u8) !T {
     var req = try client.request(if (payload == null) .GET else .POST, url, .{ .extra_headers = headers });

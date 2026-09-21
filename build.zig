@@ -4,7 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const known_folders = b.dependency("known_folders", .{});
+    const known_folders = b.dependency("known_folders", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.addModule("zmc", .{
         .root_source_file = b.path("src/root.zig"),

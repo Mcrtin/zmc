@@ -3,52 +3,9 @@ const Io = std.Io;
 const builtin = @import("builtin");
 const http = @import("http.zig");
 const Paths = @import("Paths.zig");
+const Session = @import("Session.zig");
 
 const MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
-
-pub const Session = struct {
-    username: []const u8,
-    uuid: []const u8,
-    xuid: []const u8,
-    access_token: []const u8,
-    refresh_token: ?[]const u8,
-    user_type: enum { legacy, msa },
-
-    pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
-        allocator.free(self.username);
-        allocator.free(self.uuid);
-        allocator.free(self.xuid);
-        allocator.free(self.access_token);
-        if (self.refresh_token) |t| allocator.free(t);
-    }
-
-    pub fn offline(allocator: std.mem.Allocator, name: []const u8) !Session {
-        var md5 = std.crypto.hash.Md5.init(.{});
-        md5.update("OfflinePlayer:");
-        md5.update(name);
-        var digest: [16]u8 = undefined;
-        md5.final(&digest);
-
-        digest[6] = (digest[6] & 0x0F) | 0x30;
-        digest[8] = (digest[8] & 0x3F) | 0x80;
-
-        const uuid_str = try std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-            digest[0],  digest[1],  digest[2],  digest[3],
-            digest[4],  digest[5],  digest[6],  digest[7],
-            digest[8],  digest[9],  digest[10], digest[11],
-            digest[12], digest[13], digest[14], digest[15],
-        });
-
-        return Session{
-            .username = try allocator.dupe(u8, name),
-            .uuid = uuid_str,
-            .access_token = try allocator.dupe(u8, "0"),
-            .xuid = try allocator.dupe(u8, "0"),
-            .user_type = .legacy,
-            .refresh_token = null,
-        };
-    }
-};
 
 pub fn fetchVersionManifest(arena: std.mem.Allocator, client: *std.http.Client) !Manifest {
     return http.requestJson(Manifest, arena, client, manifest_url, &.{}, null);

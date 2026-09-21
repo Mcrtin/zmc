@@ -2,9 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const Paths = @import("Paths.zig");
 const mojang = @import("mojang.zig");
-const msa = @import("msa.zig");
 const known_folders = @import("known-folders");
-const SessionStore = @import("SessionStore.zig");
+const Session = @import("Session.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -32,14 +31,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const cache_path = try known_folders.getPath(io, gpa, init.environ_map, .cache);
-    defer if (cache_path) |c| gpa.free(c);
-
-    const store = if (cache_path) |c| try SessionStore.init(io, c) else null;
-    defer if (store) |s| s.deinit(io);
-
     var mc_paths = try Paths.resolve(io, gpa, init.environ_map);
-    defer mc_paths.deinit();
+    defer mc_paths.deinit(gpa);
     std.log.info("Using Minecraft directory: {s}", .{mc_paths.root});
 
     var client = std.http.Client{ .allocator = gpa, .io = io };
@@ -67,23 +60,45 @@ pub fn main(init: std.process.Init) !void {
     group.async(io, ensureClient, .{ io, node, &client, &mc_paths, chosen.id, version });
     group.async(io, ensureLibs, .{ io, gpa, node, &client, &mc_paths, version, &classpath_list });
     group.async(io, ensureAssets, .{ io, gpa, node, &client, &mc_paths, version });
-
-    var refresh_token_buf: [1024]u8 = undefined;
-    var last_name_buf: [1024]u8 = undefined;
-
-    const selected_name = name orelse if (store) |s| try s.last(io, &last_name_buf) else null;
-    const refresh_token = if (selected_name) |n|
-        (if (store) |s| try s.read(io, n, &refresh_token_buf) else null)
-    else
-        null;
-
-    var session: mojang.Session = if (!offline)
-        try msa.authenticate(io, gpa, &client, refresh_token)
-    else
-        try mojang.Session.offline(gpa, name.?);
-    if (session.refresh_token) |r| {
-        if (store) |s| try s.write(io, session.username, r);
-    }
+    const cache_path = (try known_folders.getPath(io, gpa, init.environ_map, .cache)).?;
+    defer gpa.free(cache_path);
+    var token_buf: [4096]u8 = undefined;
+    const session: Session =
+        if (offline) try .offline(gpa, name orelse "Player") else blk: {
+            const store = try Session.Store.open(io, cache_path);
+            if (name) |n| {
+                var it = try store.list();
+                while (try it.next(io)) |acc| {
+                    if (std.ascii.eqlIgnoreCase(acc.name, n)) {
+                        const session = try Session.online(io, gpa, &client, try store.read(io, acc.name, &token_buf));
+                        errdefer session.deinit(gpa);
+                        try store.write(io, acc.name, session.refresh_token.?);
+                        break :blk session;
+                    }
+                } else {
+                    std.log.warn("Account '{s}' not found. Authenticating.", .{n});
+                    const session = try Session.online(io, gpa, &client, null);
+                    errdefer session.deinit(gpa);
+                    try store.write(io, n, session.refresh_token.?);
+                    break :blk session;
+                }
+            } else {
+                var last_name_buf: [128]u8 = undefined;
+                if (try store.last(io, &last_name_buf)) |last| {
+                    const session = try Session.online(io, gpa, &client, try store.read(io, last, &token_buf));
+                    errdefer session.deinit(gpa);
+                    try store.write(io, last, session.refresh_token.?);
+                    break :blk session;
+                } else {
+                    std.log.warn("No last used account present. Authenticating.", .{});
+                    const session = try Session.online(io, gpa, &client, null);
+                    errdefer session.deinit(gpa);
+                    try store.write(io, session.username, session.refresh_token.?);
+                    break :blk session;
+                }
+            }
+            try store.save(io, mc_paths.root);
+        };
     defer session.deinit(gpa);
     const features: mojang.Features = .{};
 

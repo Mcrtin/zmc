@@ -5,19 +5,18 @@ const known_folders = @import("known-folders");
 
 const Paths = @This();
 
-allocator: std.mem.Allocator,
 root: []const u8,
 versions: []const u8,
 libraries: []const u8,
 assets: []const u8,
 natives_root: []const u8,
 
-pub fn deinit(self: *Paths) void {
-    self.allocator.free(self.root);
-    self.allocator.free(self.versions);
-    self.allocator.free(self.libraries);
-    self.allocator.free(self.assets);
-    self.allocator.free(self.natives_root);
+pub fn deinit(self: *Paths, allocator: std.mem.Allocator) void {
+    allocator.free(self.root);
+    allocator.free(self.versions);
+    allocator.free(self.libraries);
+    allocator.free(self.assets);
+    allocator.free(self.natives_root);
 }
 
 fn defaultRoot(io: Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
@@ -58,7 +57,6 @@ pub fn resolve(io: Io, allocator: std.mem.Allocator, env: *const std.process.Env
     try cwd.createDirPath(io, natives_root);
 
     return Paths{
-        .allocator = allocator,
         .root = root,
         .versions = versions,
         .libraries = libraries,
