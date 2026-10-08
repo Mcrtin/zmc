@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const Paths = @import("Paths.zig");
 const Session = @import("Session.zig");
 const Allocator = std.mem.Allocator;
+const HttpClient = std.http.Client;
 
 const MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
@@ -15,18 +16,9 @@ pub fn fetchVersion(arena: std.mem.Allocator, client: *std.http.Client, url: []c
     return Session.requestJson(Package, arena, client, try std.Uri.parse(url), &.{}, null);
 }
 
-pub fn ensureClient(
-    io: Io,
-    node: std.Progress.Node,
-    client: *std.http.Client,
-    paths: *Paths,
-    version_id: []const u8,
-    client_download: Download,
-) !void {
-    node.increaseEstimatedTotalItems(1);
-    const file = try obtainFile(io, client, client_download.url, client_download.sha1, client_download.size, &.{ paths.versions, version_id, version_id }, ".jar");
+pub fn ensureClient(io: Io, client: *HttpClient, versions_path: []const u8, version: []const u8, dl: Download) !void {
+    const file = try obtainFile(io, client, dl.url, dl.sha1, dl.size, &.{ versions_path, version, version }, ".jar");
     file.close(io);
-    node.completeOne();
 }
 
 const os_name: OsName = switch (builtin.os.tag) {
@@ -72,6 +64,80 @@ pub fn ensureLibraries(
     lib_node.end();
 }
 
+/// "liblwjgl.so.1.2.3" -> "liblwjgl.so". Leaves .dll/.dylib untouched since
+/// they don't use the SONAME-version convention.
+fn stripSoVersion(name: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, name, '.');
+    var so_end: ?usize = null;
+    var offset: usize = 0;
+    while (it.next()) |part| {
+        offset += part.len;
+        if (std.mem.eql(u8, part, "so")) so_end = offset;
+        offset += 1; // account for the '.'
+    }
+    return if (so_end) |end| name[0..end] else name;
+}
+
+pub const LibraryFiles = struct {
+    class_files: [][]const u8,
+    natives_files: [][]const u8,
+};
+
+pub fn finalizeLibraries(
+    io: Io,
+    gpa: std.mem.Allocator,
+    bin_root: []const u8,
+    version: []const u8,
+    files: *LibraryFiles,
+) ![]const u8 {
+    const bin_dir_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ bin_root, version });
+    errdefer gpa.free(bin_dir_path);
+
+    const bin_dir = try Io.Dir.cwd().createDirPathOpen(io, bin_dir_path, .{});
+    defer bin_dir.close(io);
+
+    for (files.natives_files) |src_path| {
+        const ext = std.fs.path.extension(src_path);
+        if (std.mem.eql(u8, ext, ".zip") or std.mem.eql(u8, ext, ".jar")) {
+            try extractNativesFromArchive(io, src_path, bin_dir);
+        } else {
+            try copyNativeFile(io, src_path, bin_dir);
+        }
+    }
+
+    return bin_dir_path;
+}
+
+fn extractNativesFromArchive(io: Io, src_path: []const u8, dst_dir: Io.Dir) !void {
+    const file = try Io.Dir.cwd().openFile(io, src_path, .{});
+    defer file.close(io);
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    var iter = try std.zip.Iterator.init(&reader);
+    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    while (try iter.next()) |item| {
+        try reader.seekTo(item.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        const filename = reader.interface.take(item.filename_len) catch return reader.err.?;
+        const ext = std.fs.path.extension(filename);
+        const is_lib = std.mem.eql(u8, ext, ".so") or
+            std.mem.eql(u8, ext, ".dll") or
+            std.mem.eql(u8, ext, ".dylib");
+        if (!is_lib) continue;
+        item.extract(reader, .{}, &filename_buf, dst_dir);
+    }
+}
+
+fn copyNativeFile(io: Io, src_path: []const u8, dst_dir: Io.Dir) !void {
+    const raw_name = std.fs.path.basename(src_path);
+    const dst_name = stripSoVersion(raw_name);
+
+    Io.Dir.cwd().symLink(io, src_path, dst_dir, dst_name, .{}) catch { // <- name guess
+        try Io.Dir.cwd().copyFile(io, src_path, dst_dir, dst_name, .{}); // <- name guess
+    };
+}
+
 pub fn getClasspath(alloc: Allocator, libs: []const Library) Allocator.Error![]const []const u8 {
     var classpath: std.ArrayList([]const u8) = try .initCapacity(alloc, libs.len);
     for (libs) |lib|
@@ -79,19 +145,12 @@ pub fn getClasspath(alloc: Allocator, libs: []const Library) Allocator.Error![]c
     return classpath.toOwnedSlice(alloc);
 }
 
-fn downloadLib(
-    io: Io,
-    client: *std.http.Client,
-    node: std.Progress.Node,
-    lib_path: []const u8,
-    artifact: Artifact,
-) void {
+fn downloadLib(io: Io, client: *HttpClient, node: std.Progress.Node, lib_path: []const u8, artifact: Artifact) void {
     const file = obtainFile(io, client, artifact.url, artifact.sha1, artifact.size, &.{ lib_path, artifact.path }, "") catch |err| {
         std.log.err("failed to download lib: {t}", .{err});
         return;
     };
     file.close(io);
-
     node.completeOne();
 }
 
@@ -101,14 +160,13 @@ pub fn getAssetIndex(
     arena: Allocator,
     client: *std.http.Client,
     assets_path: []const u8,
-    asset_index: Package.AssetIndexDownload,
+    asset_index: AssetIndexDownload,
 ) !AssetIndex {
     const file = try obtainFile(io, client, asset_index.url, asset_index.sha1, asset_index.size, &.{ assets_path, "indexes", asset_index.id }, ".json");
     var buf: [1024]u8 = undefined;
     var reader = file.reader(io, &buf);
     var json_reader = std.json.Reader.init(arena, &reader.interface);
     defer json_reader.deinit();
-
     return try std.json.parseFromTokenSourceLeaky(AssetIndex, arena, &json_reader, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
 }
 
@@ -385,9 +443,8 @@ pub const Package = struct {
         server_mappings: ?Download = null,
         windows_server: ?Download = null,
     };
-
-    const AssetIndexDownload = struct { id: []const u8, sha1: []const u8, size: u32, totalSize: u32, url: []const u8 };
 };
+const AssetIndexDownload = struct { id: []const u8, sha1: []const u8, size: u32, totalSize: u32, url: []const u8 };
 const VersionType = enum { snapshot, release, old_alpha, old_beta };
 const Manifest = struct {
     latest: struct { release: []const u8, snapshot: []const u8 },

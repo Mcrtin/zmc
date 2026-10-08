@@ -326,115 +326,6 @@ fn openUrl(io: Io, gpa: std.mem.Allocator, url: []const u8) !void {
 }
 
 pub const Store = struct {
-    // pub const GameProfile = struct {
-    //     name: []const u8,
-    //     type: []const u8,
-    //     created: []const u8,
-    //     lastUsed: []const u8,
-    //     icon: []const u8,
-    //     lastVersionId: []const u8,
-    //     gameDir: []const u8,
-    //     javaDir: []const u8,
-    //     javaArgs: []const u8,
-    //     logConfig: []const u8,
-    //     logConfigIsXML: bool,
-    //     resolution: struct {
-    //         height: u32,
-    //         width: u32,
-    //     },
-    // };
-    // pub const Authentication = struct {
-    //     accessToken: []const u8,
-    //     username: []const u8,
-    //
-    //     profiles: std.json.ArrayHashMap([]const u8),
-    // };
-    // profiles: std.json.ArrayHashMap(GameProfile),
-    // clientToken: []const u8,
-    // authenticationDatabase: std.json.ArrayHashMap(Authentication),
-    // launcherVersion: struct {
-    //     name: []const u8,
-    //     format: u32,
-    //     profilesFormat: u32,
-    // },
-    // settings: struct {
-    //     enableSnapshots: bool,
-    //     enableAdvanced: bool,
-    //     keepLauncherOpen: bool,
-    //     showGameLog: bool,
-    //     locale: []const u8,
-    //     showMenu: bool,
-    //     enableHistorical: bool,
-    //     profileSorting: enum { byName, byLastPlayed },
-    //     crashAssistance: bool,
-    // },
-    // enableAnalytics: bool,
-    // analyticsToken: []const u8,
-    // analyticsFailcount: u32,
-    // selectedUser: struct {
-    //     account: []const u8,
-    //     profile: []const u8,
-    // },
-    //
-    // pub const empty: Store = .{
-    //     .profiles = .{ .map = .empty },
-    //     .clientToken = "",
-    //     .authenticationDatabase = .{ .map = .empty },
-    //     .launcherVersion = .{ .name = "zmc", .format = 0, .profilesFormat = 0 },
-    //     .settings = .{
-    //         .enableSnapshots = true,
-    //         .enableAdvanced = true,
-    //         .keepLauncherOpen = false,
-    //         .showGameLog = false,
-    //         .locale = "en-us",
-    //         .showMenu = false,
-    //         .enableHistorical = true,
-    //         .profileSorting = .byLastPlayed,
-    //         .crashAssistance = false,
-    //     },
-    //     .enableAnalytics = false,
-    //     .analyticsToken = "",
-    //     .analyticsFailcount = 0,
-    //     .selectedUser = .{
-    //         .account = "",
-    //         .profile = "",
-    //     },
-    // };
-
-    // pub fn open(io: Io, alloc: Allocator, path: []const u8) !Store {
-    //     const dir = try Io.Dir.cwd().createDirPathOpen(io, path, .{});
-    //     defer dir.close(io);
-    //     const file = dir.openFile(io, "launcher_accounts.json", .{}) catch |err| switch (err) {
-    //         error.FileNotFound => return .empty,
-    //         else => |e| return e,
-    //     };
-    //     defer file.close(io);
-    //     var buf: [1024]u8 = undefined;
-    //     var reader = file.reader(io, &buf);
-    //     const json_reader: std.json.Reader = .init(alloc, &reader.interface);
-    //     return std.json.parseFromTokenSourceLeaky(Store, alloc, json_reader, .{});
-    // }
-    //
-    // pub fn activate(store: *Store, alloc: Allocator, account: Authentication) !void {
-    //     store.selectedUser.profile = account.profiles.map.keys()[0];
-    //     store.selectedUser.account = store.selectedUser.profile;
-    //     try store.authenticationDatabase.map.put(alloc, store.selectedUser.account, account);
-    // }
-    //
-    // pub fn active(store: *Store) ?Authentication {
-    //     store.authenticationDatabase.map.get(store.selectedUser.account);
-    // }
-    //
-    // pub fn save(store: Store, io: Io, minecraft_folder: []const u8) !void {
-    //     const dir = try Io.Dir.cwd().createDirPathOpen(io, minecraft_folder, .{});
-    //     defer dir.close(io);
-    //     const file = try dir.createFile(io, "launcher_accounts.json", .{});
-    //     defer file.close(io);
-    //     var buf: [1024]u8 = undefined;
-    //     var writer = file.writer(io, &buf);
-    //     var json_writer: std.json.Stringify = .{ .writer = &writer.interface };
-    //     try json_writer.write(store);
-    // }
     last_opened: Io.File,
     token_dir: Io.Dir,
 
@@ -475,5 +366,101 @@ pub const Store = struct {
     pub fn deinit(self: @This(), io: Io) void {
         self.last_opened.close(io);
         self.token_dir.close(io);
+    }
+};
+
+pub const Profiles = struct {
+    pub const GameProfile = struct {
+        pub const Type = enum { custom, @"latest-release", @"latest-snapshot" };
+        name: []const u8,
+        type: Type,
+        created: ?[]const u8 = null,
+        lastUsed: ?[]const u8 = null,
+        icon: ?[]const u8 = null,
+        lastVersionId: []const u8,
+        gameDir: []const u8,
+        javaDir: ?[]const u8 = null,
+        javaArgs: ?[]const u8 = null,
+        logConfig: ?[]const u8 = null,
+        logConfigIsXML: ?bool = null,
+        resolution: struct {
+            height: u32,
+            width: u32,
+        } = null,
+
+        pub fn init(name: []const u8, profile_type: Type, version: []const u8, game_dir: []const u8) GameProfile {
+            return .{
+                .name = name,
+                .type = profile_type,
+                .lastVersionId = version,
+                .gameDir = game_dir,
+            };
+        }
+    };
+    pub const Authentication = struct {
+        accessToken: ?[]const u8 = null,
+        username: []const u8,
+        profiles: std.json.ArrayHashMap([]const u8) = .{ .map = .empty },
+    };
+    profiles: std.json.ArrayHashMap(GameProfile) = .{ .map = .empty },
+    clientToken: ?[]const u8 = null,
+    authenticationDatabase: std.json.ArrayHashMap(Authentication) = .{ .map = .empty },
+    launcherVersion: struct {
+        name: []const u8 = "zmc",
+        format: u32 = 0,
+        profilesFormat: u32 = 0,
+    },
+    settings: struct {
+        enableSnapshots: bool = true,
+        enableAdvanced: bool = true,
+        keepLauncherOpen: bool = false,
+        showGameLog: bool = false,
+        locale: []const u8 = "en-us",
+        showMenu: bool = false,
+        enableHistorical: bool = true,
+        profileSorting: enum { byName, byLastPlayed } = .byLastPlayed,
+        crashAssistance: bool = false,
+    } = .{},
+    enableAnalytics: bool = false,
+    analyticsToken: ?[]const u8 = null,
+    analyticsFailcount: u32 = 0,
+    selectedUser: ?struct {
+        account: []const u8,
+        profile: []const u8,
+    } = null,
+
+    pub fn open(io: Io, alloc: Allocator, minecraft_folder: []const u8) !Profile {
+        const dir = try Io.Dir.cwd().createDirPathOpen(io, minecraft_folder, .{});
+        defer dir.close(io);
+        const file = dir.openFile(io, "launcher_accounts.json", .{}) catch |err| switch (err) {
+            error.FileNotFound => return .{},
+            else => |e| return e,
+        };
+        defer file.close(io);
+        var buf: [1024]u8 = undefined;
+        var reader = file.reader(io, &buf);
+        const json_reader: std.json.Reader = .init(alloc, &reader.interface);
+        return std.json.parseFromTokenSourceLeaky(Profile, alloc, json_reader, .{});
+    }
+
+    pub fn activate(profiles: *Profiles, alloc: Allocator, account: Authentication) !void {
+        profiles.selectedUser.profile = account.profiles.map.keys()[0];
+        profiles.selectedUser.account = profiles.selectedUser.profile;
+        try profiles.authenticationDatabase.map.put(alloc, profiles.selectedUser.account, account);
+    }
+
+    pub fn active(profiles: *Profiles) ?Authentication {
+        profiles.authenticationDatabase.map.get(profiles.selectedUser.account);
+    }
+
+    pub fn save(store: Store, io: Io, minecraft_folder: []const u8) !void {
+        const dir = try Io.Dir.cwd().createDirPathOpen(io, minecraft_folder, .{});
+        defer dir.close(io);
+        const file = try dir.createFile(io, "launcher_accounts.json", .{});
+        defer file.close(io);
+        var buf: [1024]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        var json_writer: std.json.Stringify = .{ .writer = &writer.interface };
+        try json_writer.write(store);
     }
 };

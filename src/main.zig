@@ -5,6 +5,8 @@ const mojang = @import("mojang.zig");
 const known_folders = @import("known-folders");
 const Session = @import("Session.zig");
 
+//TODO: --snapshot: latest snapshot if no --version is present, or latest loader if --loader is present (can also be both)
+// --loader: one of Fabric(LegacyFabric, Babric), Quilt, , Forge, NeoForge
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -31,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const cache_path = (try known_folders.getPath(io, gpa, init.environ_map, .cache)).?;
     var mc_paths = try Paths.resolve(io, gpa, init.environ_map);
     defer mc_paths.deinit(gpa);
     std.log.info("Using Minecraft directory: {s}", .{mc_paths.root});
@@ -52,48 +55,14 @@ pub fn main(init: std.process.Init) !void {
     const version = try mojang.fetchVersion(init.arena.allocator(), &client, chosen.url);
 
     var group: Io.Group = .init;
-    const node = std.Progress.start(io, .{ .root_name = "downloading minecraft" });
+    const node = std.Progress.start(io, .{ .root_name = "setting-up minecraft" });
 
     group.async(io, ensureClient, .{ io, node, &client, &mc_paths, chosen.id, version });
     group.async(io, mojang.ensureLibraries, .{ io, node, &client, mc_paths.libraries, version.libraries });
     group.async(io, ensureAssets, .{ io, gpa, node, &client, &mc_paths, version });
-    const cache_path = (try known_folders.getPath(io, gpa, init.environ_map, .cache)).?;
-    defer gpa.free(cache_path);
-    var token_buf: [4096]u8 = undefined;
-    var last_name_buf: [128]u8 = undefined;
-    const session: Session =
-        if (offline) try .offline(gpa, name orelse "Player") else blk: {
-            const store: Session.Store = try .open(io, cache_path);
-            if (name) |n| {
-                var it = try store.list();
-                while (try it.next(io)) |acc| {
-                    if (std.ascii.eqlIgnoreCase(acc.name, n)) {
-                        const session = try Session.online(io, gpa, &client, try store.read(io, acc.name, &token_buf));
-                        errdefer session.deinit(gpa);
-                        try store.write(io, acc.name, session.refresh_token.?);
-                        break :blk session;
-                    }
-                } else {
-                    std.log.warn("Account '{s}' not found. Authenticating.", .{n});
-                    const session = try Session.online(io, gpa, &client, null);
-                    errdefer session.deinit(gpa);
-                    try store.write(io, n, session.refresh_token.?);
-                    break :blk session;
-                }
-            } else {
-                const token = if (try store.last(io, &last_name_buf)) |last|
-                    try store.read(io, last, &token_buf)
-                else
-                    null;
-
-                if (token == null) std.log.warn("No last used account present. Authenticating.", .{});
-                const session = try Session.online(io, gpa, &client, token);
-                errdefer session.deinit(gpa);
-                try store.write(io, session.username, session.refresh_token.?);
-                break :blk session;
-            }
-        };
-    defer session.deinit(gpa);
+    var session: ?Session = null;
+    defer if (session) |s| s.deinit(gpa);
+    group.async(io, getSession, .{ io, gpa, cache_path, offline, name, &client, &session });
 
     const classpath = try mojang.getClasspath(gpa, version.libraries);
     defer gpa.free(classpath);
@@ -103,6 +72,8 @@ pub fn main(init: std.process.Init) !void {
     try group.await(io);
     node.end();
 
+    if (session == null) return error.SessionMissing;
+
     try mojang.launch(
         io,
         gpa,
@@ -111,9 +82,53 @@ pub fn main(init: std.process.Init) !void {
         classpath,
         version.assetIndex.id,
         version,
-        session,
+        session.?,
         features,
     );
+}
+
+pub fn getSession(io: Io, gpa: std.mem.Allocator, cache_path: []const u8, offline: bool, name: ?[]const u8, client: *std.http.Client, out: *?Session) void {
+    out.* = getSessionInner(io, gpa, cache_path, offline, name, client) catch |err| {
+        std.log.err("error while obtaining session: {t}", .{err});
+        return;
+    };
+}
+
+pub fn getSessionInner(io: Io, gpa: std.mem.Allocator, cache_path: []const u8, offline: bool, name: ?[]const u8, client: *std.http.Client) !Session {
+    defer gpa.free(cache_path);
+    var token_buf: [4096]u8 = undefined;
+    var last_name_buf: [128]u8 = undefined;
+    return if (offline) try .offline(gpa, name orelse "Player") else blk: {
+        const store: Session.Store = try .open(io, cache_path);
+        if (name) |n| {
+            var it = try store.list();
+            while (try it.next(io)) |acc| {
+                if (std.ascii.eqlIgnoreCase(acc.name, n)) {
+                    const session = try Session.online(io, gpa, client, try store.read(io, acc.name, &token_buf));
+                    errdefer session.deinit(gpa);
+                    try store.write(io, acc.name, session.refresh_token.?);
+                    break :blk session;
+                }
+            } else {
+                std.log.warn("Account '{s}' not found. Authenticating.", .{n});
+                const session = try Session.online(io, gpa, client, null);
+                errdefer session.deinit(gpa);
+                try store.write(io, n, session.refresh_token.?);
+                break :blk session;
+            }
+        } else {
+            const token = if (try store.last(io, &last_name_buf)) |last|
+                try store.read(io, last, &token_buf)
+            else
+                null;
+
+            if (token == null) std.log.warn("No last used account present. Authenticating.", .{});
+            const session = try Session.online(io, gpa, client, token);
+            errdefer session.deinit(gpa);
+            try store.write(io, session.username, session.refresh_token.?);
+            break :blk session;
+        }
+    };
 }
 
 pub fn ensureClient(
@@ -124,10 +139,11 @@ pub fn ensureClient(
     version_id: []const u8,
     version: mojang.Package,
 ) void {
-    const client_node = node.start("downloading client", 0);
-    mojang.ensureClient(io, node, client, paths, version_id, version.downloads.client) catch |err| {
+    const client_node = node.start("downloading client", 1);
+    mojang.ensureClient(io, client, paths.versions, version_id, version.downloads.client) catch |err| {
         std.log.err("error while downloading client: {t}", .{err});
     };
+    client_node.completeOne();
     client_node.end();
 }
 

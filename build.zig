@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
     if (b.args) |args| run_cmd.addArgs(args);
 
     const run_step = b.step("run", "Build and run the launcher");
